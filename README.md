@@ -59,6 +59,7 @@ This toggles the UltimaMacros editor frame.
 1. Click **New (C)** to create a per-character macro, or **New (A)** for an account-wide macro.
 2. Enter a **name** in the top box.
 3. Write your macro body in the large bottom editor box.
+4. Click the macro icon on the right of the Delete button to go through a selection of icons.
 
 > The editor supports any standard Blizzard macro commands and commands from any installed addons.
 
