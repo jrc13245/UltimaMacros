@@ -41,7 +41,7 @@ WTF\Account<ACCOUNT>\SavedVariables\UltimaMacros.lua
 
 ---
 
-https://github.com/jrc13245/UltimaMacros/main/example/UltimaMacrosExample.png
+https://github.com/jrc13245/UltimaMacros/raw/main/example/UltimaMacrosExample.png
 
 ---
 
