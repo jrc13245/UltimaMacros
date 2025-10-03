@@ -1,0 +1,10 @@
+## Interface: 11200
+## Title: UltimaMacros
+## Notes: Extra macro storage
+## Author: torio
+## Version: 1.0.0
+## SavedVariables: UltimaMacrosDB
+## OptionalDeps: SuperCleveroidMacros, SuperMacro
+
+UltimaMacros.lua
+
