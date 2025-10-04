@@ -1,5 +1,5 @@
 -- UltimaMacros - Vanilla 1.12.1 (Lua 5.0)
--- Separate macro list stored in SavedVariables with 1028-char per macro cap.
+-- Separate macro list stored in SavedVariables with 2056-char per macro cap.
 -- Supports per-macro scope: per-character or per-account.
 -- SuperMacro-style action mapping: NO reliance on Blizzard macro storage for macro content.
 -- We briefly use a proxy macro only to put a valid payload on the cursor during drag.
@@ -181,8 +181,8 @@ local function UM_Save(name, text, scope)
     return
   end
   if not text then text = "" end
-  if string.len(text) > 1028 then
-    text = string.sub(text, 1, 1028)
+  if string.len(text) > 2056 then
+    text = string.sub(text, 1, 2056)
   end
 
   UM_EnsureTables()
@@ -760,7 +760,7 @@ SlashCmdList["ULTIMAMACROS"] = function(msg)
     DEFAULT_CHAT_FRAME:AddMessage("|cff88ccffUltimaMacros: "..table.getn(list).." macros (char+account)|r")
     for i=1, table.getn(list) do
       local tag = (list[i]._scope == "account") and "[A]" or "[C]"
-      DEFAULT_CHAT_FRAME:AddMessage(" - "..tag.." "..list[i].name.." ("..string.len(list[i].text or "").."/1028)")
+      DEFAULT_CHAT_FRAME:AddMessage(" - "..tag.." "..list[i].name.." ("..string.len(list[i].text or "").."/2056)")
     end
   else
     DEFAULT_CHAT_FRAME:AddMessage("|cffff5555Unknown subcommand. Try /umacro help|r")
@@ -875,8 +875,8 @@ end
 function UM_UI_Save()
   local name = UltimaMacrosFrameNameEdit:GetText() or ""
   local text = UltimaMacrosFrameEditBox:GetText() or ""
-  if string.len(text) > 1028 then
-    text = string.sub(text, 1, 1028)
+  if string.len(text) > 2056 then
+    text = string.sub(text, 1, 2056)
     UltimaMacrosFrameEditBox:SetText(text)
   end
   UM_Save(name, text, UM_UI_Scope)
@@ -933,12 +933,12 @@ function UM_UI_UpdateCounter()
   end
   local text = UltimaMacrosFrameEditBox:GetText() or ""
   local used = string.len(text)
-  if used > 1028 then
-    text = string.sub(text, 1, 1028)
+  if used > 2056 then
+    text = string.sub(text, 1, 2056)
     UltimaMacrosFrameEditBox:SetText(text)
-    used = 1028
+    used = 2056
   end
-  UltimaMacrosFrameCounter:SetText(used .. "/1028")
+  UltimaMacrosFrameCounter:SetText(used .. "/2056")
 end
 
 function UM_UI_ToggleScope()
@@ -1144,7 +1144,7 @@ function UM_BuildGUI()
 
   local counter = f:CreateFontString("UltimaMacrosFrameCounter", "OVERLAY", "GameFontHighlightSmall")
   counter:SetPoint("TOPRIGHT", editorBG, "BOTTOMRIGHT", -6, -4)
-  counter:SetText("0/1028")
+  counter:SetText("0/2056")
 
   -- Body area: ScrollFrame + EditBox
   local editScroll = CreateFrame("ScrollFrame", "UltimaMacrosEditScroll", f, "UIPanelScrollFrameTemplate")
@@ -1155,33 +1155,108 @@ function UM_BuildGUI()
   -- Create the EditBox BEFORE assigning as child
   local editBox = CreateFrame("EditBox", "UltimaMacrosFrameEditBox", editScroll)
   editBox:SetMultiLine(true)
-  editBox:SetWidth(380); editBox:SetHeight(260)
+  editBox:SetWidth(380)
+
+  -- Give it a tall canvas so the scrollbar has range. (Big but cheap.)
+  editBox:SetHeight(2000)
+
+  -- Padding & font
   editBox:SetTextInsets(6, 6, 4, 4)
   editBox:SetFontObject(ChatFontNormal)
+
+  -- Focus & input
   editBox:SetAutoFocus(false)
   editBox:EnableMouse(true)
   editBox:EnableKeyboard(true)
-  editBox:SetScript("OnTextChanged", function() if UM_UI_OnTextChanged then UM_UI_OnTextChanged() end end)
 
+  -- After setting the child, ensure the scrollable rect is correct
+  editScroll:SetScrollChild(editBox)
+  if editScroll.UpdateScrollChildRect then editScroll:UpdateScrollChildRect() end
 
-  -- Click inside → focus body (Vanilla: use 'this')
+  editBox:SetScript("OnTextChanged", function()
+    if UM_UI_OnTextChanged then UM_UI_OnTextChanged() end
+    if UltimaMacrosEditScroll and UltimaMacrosEditScroll.UpdateScrollChildRect then
+      UltimaMacrosEditScroll:UpdateScrollChildRect()
+    else
+      UltimaMacrosEditScroll:SetScrollChild(editBox) -- fallback
+    end
+  end)
+
+  -- Click inside → focus body
   editBox:SetScript("OnMouseDown", function() this:SetFocus() end)
 
-  -- Tab → go back to the name
+  -- Tab ↔ name field
   editBox:SetScript("OnTabPressed", function()
-  if UltimaMacrosFrameNameEdit then UltimaMacrosFrameNameEdit:SetFocus() end
-    end)
+    if UltimaMacrosFrameNameEdit then UltimaMacrosFrameNameEdit:SetFocus() end
+  end)
 
   -- Esc → clear focus (Esc again closes via UISpecialFrames)
   editBox:SetScript("OnEscapePressed", function() this:ClearFocus() end)
 
-  -- Now wire the scroll child (AFTER editBox exists)
-  editScroll:SetScrollChild(editBox)
+  -- Keep caret in view while typing/navigating (1.12-safe, nil-guarded)
+  editBox:SetScript("OnCursorChanged", function(x, y, w, h)
+    local sf = UltimaMacrosEditScroll
+    if not sf then return end
 
-  -- If you click anywhere on the scrollframe background, focus the edit box
+    -- y/h can be nil briefly; bail out cleanly
+    if not y or not h then
+      if sf.UpdateScrollChildRect then sf:UpdateScrollChildRect() end
+      return
+    end
+
+    -- Convert caret coords to scroll offsets
+    local view = sf:GetHeight() or 0
+    local cur  = sf:GetVerticalScroll() or 0
+
+    -- In vanilla, y is negative as you go down; top-of-caret in scrollspace:
+    local top    = -y
+    local bottom = top + h
+
+    -- Clamp targets a bit inside the view (padding = 8)
+    local PAD = 8
+
+    if top < cur + PAD then
+      sf:SetVerticalScroll(math.max(top - PAD, 0))
+    elseif bottom > (cur + view - PAD) then
+      sf:SetVerticalScroll(math.max(bottom - view + PAD, 0))
+    end
+  end)
+
+  -- Helper: wheel scrolling that works on 1.12 templates
+  local function UM_WheelScroll(sf, delta)
+    -- Prefer Blizzard's template on Vanilla, but set `this` first.
+    if ScrollFrameTemplate_OnMouseWheel then
+      local oldThis = this
+      this = sf
+      ScrollFrameTemplate_OnMouseWheel(delta or 0)  -- Vanilla expects only the delta
+      this = oldThis
+      return
+    end
+    -- Manual fallback: drive the scrollbar directly
+    local bar = getglobal(sf:GetName() .. "ScrollBar")
+    if not bar then return end
+    local step = (bar:GetValueStep() or 20) * 3
+    bar:SetValue((bar:GetValue() or 0) - (delta or 0) * step)
+  end
+
+  -- Make sure both can receive wheel input
+  editScroll:EnableMouseWheel(true)
+  editBox:EnableMouseWheel(true)
+
+  -- Scroll on the scrollframe
+  editScroll:SetScript("OnMouseWheel", function()
+    UM_WheelScroll(this, arg1 or 0)
+  end)
+
+  -- Scroll when the mouse is over the edit box
+  editBox:SetScript("OnMouseWheel", function()
+    UM_WheelScroll(UltimaMacrosEditScroll, arg1 or 0)
+  end)
+
+  -- Click the scrollframe background → focus the edit box
   editScroll:SetScript("OnMouseDown", function()
-  if UltimaMacrosFrameEditBox then UltimaMacrosFrameEditBox:SetFocus() end
-    end)
+    if UltimaMacrosFrameEditBox then UltimaMacrosFrameEditBox:SetFocus() end
+  end)
 
   UM_LocalUI.listScroll  = listScroll
   UM_LocalUI.listContent = listContent

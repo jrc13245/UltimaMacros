@@ -1,7 +1,7 @@
 # UltimaMacros
 
 A lightweight, self-contained macro system for **World of Warcraft 1.12.1**.  
-Provides its own macro storage (up to **1028 characters** per macro) and an in-game editor with per-character or account-wide scope.
+Provides its own macro storage (up to **2056 characters** per macro) and an in-game editor with per-character or account-wide scope.
 
 UltimaMacros:
 
@@ -15,7 +15,7 @@ UltimaMacros:
 ## ✨ Features
 
 - **Separate macro storage** (doesn’t count against Blizzard’s macro limits).
-- **Longer macros**: up to 1028 characters.
+- **Longer macros**: up to 2056 characters.
 - **Per-character or account-wide** macros (toggle in the UI).
 - **Drag & drop action mapping** — place any UltimaMacro onto your action bars.
 - **Dynamic icon & tooltip updates** when you edit or save a macro (no UI reload needed).
@@ -94,7 +94,7 @@ Executes a saved macro directly by name.
 - **Tab / Enter** in the name field → jump to the body field.
 - **Tab** in the body field → jump back to the name field.
 - **Esc** clears focus; press **Esc again** to close the window.
-- Character counter shows `used/1028` characters.
+- Character counter shows `used/2056` characters.
 
 ---
 
