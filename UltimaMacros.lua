@@ -424,35 +424,20 @@ end
 
 local UM_proxyMacroIndex = nil
 
+-- Replace UM_GetOrCreateProxyMacroIndex() with this version
 local function UM_GetOrCreateProxyMacroIndex()
-  -- If we have a cached index and it's still valid, use it
+  -- If we cached an index and it’s still valid, reuse it
   if UM_proxyMacroIndex and UM_oldGetMacroInfo and UM_oldGetMacroInfo(UM_proxyMacroIndex) then
     return UM_proxyMacroIndex
   end
 
-  -- If any macro exists at all, just reuse index 1 as a pickup payload
+  -- If ANY macro exists, reuse index 1 as the pickup payload
   if UM_oldGetMacroInfo and UM_oldGetMacroInfo(1) then
     UM_proxyMacroIndex = 1
     return 1
   end
 
-  -- Try creating a throwaway proxy macro, trying multiple icon arg types and signatures
-  -- Most Vanilla cores want a NUMERIC icon index. We'll try 1 first.
-  local tryIcons = {
-    1,                                -- numeric index (safest on 1.12)
-    "INV_Misc_QuestionMark",          -- icon token (some cores accept this)
-    UM_TexturePath(UM_DEFAULT_ICON),  -- full texture path (rarely accepted on 1.12)
-  }
-
-  for i = 1, table.getn(tryIcons) do
-    local idx = UM_SafeCreateMacro("UMProxy", tryIcons[i], " ")
-    if idx then
-      UM_proxyMacroIndex = idx
-      return idx
-    end
-  end
-
-  -- Could not create a macro (storage full or API signature mismatch)
+  -- Do NOT create a macro; signal “no proxy available”
   return nil
 end
 
