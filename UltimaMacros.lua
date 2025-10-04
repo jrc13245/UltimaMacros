@@ -49,12 +49,11 @@ local UM_ICON_CHOICES = {
 
 local function UM_TexturePath(icon)
   icon = icon or UM_DEFAULT_ICON
+  -- accept full texture paths or short tokens
+  if string.find(icon, "\\", 1, true) or string.find(icon, "/", 1, true) then
+    return icon
+  end
   return "Interface\\Icons\\" .. icon
-end
-
--- Make the frame behave like a standard panel (ShowUIPanel/HideUIPanel)
-if UIPanelWindows then
-  UIPanelWindows["UltimaMacrosFrame"] = { area = "center", pushable = 1 }
 end
 
 -- ***********************
@@ -424,20 +423,35 @@ end
 
 local UM_proxyMacroIndex = nil
 
--- Replace UM_GetOrCreateProxyMacroIndex() with this version
 local function UM_GetOrCreateProxyMacroIndex()
-  -- If we cached an index and it’s still valid, reuse it
+  -- If we have a cached index and it's still valid, use it
   if UM_proxyMacroIndex and UM_oldGetMacroInfo and UM_oldGetMacroInfo(UM_proxyMacroIndex) then
     return UM_proxyMacroIndex
   end
 
-  -- If ANY macro exists, reuse index 1 as the pickup payload
+  -- If any macro exists at all, just reuse index 1 as a pickup payload
   if UM_oldGetMacroInfo and UM_oldGetMacroInfo(1) then
     UM_proxyMacroIndex = 1
     return 1
   end
 
-  -- Do NOT create a macro; signal “no proxy available”
+  -- Try creating a throwaway proxy macro, trying multiple icon arg types and signatures
+  -- Most Vanilla cores want a NUMERIC icon index. We'll try 1 first.
+  local tryIcons = {
+    1,                                -- numeric index (safest on 1.12)
+    "INV_Misc_QuestionMark",          -- icon token (some cores accept this)
+    UM_TexturePath(UM_DEFAULT_ICON),  -- full texture path (rarely accepted on 1.12)
+  }
+
+  for i = 1, table.getn(tryIcons) do
+    local idx = UM_SafeCreateMacro("UMProxy", tryIcons[i], " ")
+    if idx then
+      UM_proxyMacroIndex = idx
+      return idx
+    end
+  end
+
+  -- Could not create a macro (storage full or API signature mismatch)
   return nil
 end
 
@@ -835,7 +849,7 @@ function UM_UI_LoadIntoEditor(name)
     UltimaMacrosIconButton:SetNormalTexture(UM_TexturePath(icon))
     local found = 1
     for i=1, table.getn(UM_ICON_CHOICES) do
-      if UM_ICON_CHOICES[i] == icon then found = i; break end
+      if UM_TexturePath(UM_ICON_CHOICES[i]) == UM_TexturePath(icon) then found = i; break end
     end
     UltimaMacrosIconButton._idx = found
   end
@@ -948,6 +962,80 @@ function UM_UI_SetScopeChar()
   UltimaMacrosScopeCheckText:SetText("Per Character")
 end
 
+local function UM_IconBasename(tex)
+  if not tex or tex == "" then return "" end
+  local s = tex
+  local i = string.find(s, "Icons\\", 1, true)
+  if i then s = string.sub(s, i + 6) end
+  local slash = string.find(s, "\\[^\\]*$")
+  if slash then s = string.sub(s, slash + 1) end
+  local dot = string.find(s, "%.[^%.]*$")
+  if dot then s = string.sub(s, 1, dot - 1) end
+  return string.lower(s or "")
+end
+
+-- Rebuild the icon list by scanning spells, items, and macros.
+local function UM_RebuildIconChoices()
+  local seen, out = {}, {}
+
+  local function add(tex)
+    if not tex or tex == "" then return end
+    if not string.find(tex, "\\", 1, true) then
+      tex = "Interface\\Icons\\" .. tex
+    end
+    if not seen[tex] then
+      seen[tex] = true
+      table.insert(out, tex)
+    end
+  end
+
+  -- 1) Spellbook icons
+  if type(GetNumSpellTabs) == "function" and type(GetSpellTabInfo) == "function" then
+    local numTabs = GetNumSpellTabs()
+    for t = 1, (numTabs or 0) do
+      local _, _, offset, numSpells = GetSpellTabInfo(t)
+      local first = (offset or 0) + 1
+      local last  = (offset or 0) + (numSpells or 0)
+      if type(GetSpellTexture) == "function" then
+        for i = first, last do add(GetSpellTexture(i, BOOKTYPE_SPELL)) end
+      end
+    end
+  end
+
+  -- 2) Equipped items
+  if type(GetInventoryItemTexture) == "function" then
+    for slot = 0, 23 do add(GetInventoryItemTexture("player", slot)) end
+  end
+
+  -- 3) Bag items
+  if type(GetContainerNumSlots) == "function" and type(GetContainerItemInfo) == "function" then
+    for bag = 0, 4 do
+      local slots = GetContainerNumSlots(bag)
+      for slot = 1, (slots or 0) do
+        local tex = GetContainerItemInfo(bag, slot)
+        add(tex)
+      end
+    end
+  end
+
+  -- 4) Existing Blizzard macros
+  if type(GetNumMacros) == "function" and type(GetMacroInfo) == "function" then
+    local numGlobal, numChar = GetNumMacros()
+    for i = 1, (numGlobal or 0) do local _, tex = GetMacroInfo(i); add(tex) end
+    for i = 37, 36 + (numChar or 0) do local _, tex = GetMacroInfo(i); add(tex) end
+  end
+
+  -- 5) Icons used by UM macros
+  if type(UM_List) == "function" then
+    local list = UM_List()
+    for i = 1, table.getn(list) do add(UM_TexturePath(list[i].icon)) end
+  end
+
+  if table.getn(out) > 0 then
+    UM_ICON_CHOICES = out -- full texture paths now
+  end
+end
+
 -- ===========================
 -- Pure-Lua UI (no XML needed)
 -- ===========================
@@ -962,6 +1050,193 @@ local function UM_SkinFrame(frame)
   })
 end
 
+-- ============================================================
+-- Icon Picker (scrollable grid with search)
+-- ============================================================
+local UM_IconPicker = nil
+
+local function UM_CloseIconPicker()
+  if UM_IconPicker then UM_IconPicker:Hide() end
+end
+
+local function UM_EnsureIconPicker()
+  if UM_IconPicker then return UM_IconPicker end
+
+  local f = CreateFrame("Frame", "UltimaMacrosIconPicker", UIParent)
+  f:SetWidth(360); f:SetHeight(320)
+  f:SetBackdrop({ bgFile="Interface\\ChatFrame\\ChatFrameBackground",
+                  edgeFile="Interface\\Tooltips\\UI-Tooltip-Border",
+                  tile=true, tileSize=16, edgeSize=16,
+                  insets={ left=4, right=4, top=4, bottom=4 } })
+  f:SetBackdropColor(0,0,0,0.9)
+  f:SetBackdropBorderColor(0.3,0.3,0.3,1)
+  f:SetMovable(true); f:EnableMouse(true)
+  f:RegisterForDrag("LeftButton")
+  f:SetScript("OnDragStart", function() this:StartMoving() end)
+  f:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+
+  local t = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+  t:SetPoint("TOP", 0, -10)
+  t:SetText("Choose Icon")
+  f.title = t
+
+  local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+  close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -6, -6)
+
+  local lab = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  lab:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -32)
+  lab:SetText("Search")
+
+  local edit = CreateFrame("EditBox", "UltimaMacrosIconSearch", f, "InputBoxTemplate")
+  edit:SetAutoFocus(false)
+  edit:SetWidth(220); edit:SetHeight(20)
+  edit:SetPoint("LEFT", lab, "RIGHT", 8, 0)
+  edit:SetMaxLetters(64)
+  edit:SetText("")
+  f.searchBox = edit
+
+  local hint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  hint:SetPoint("LEFT", edit, "LEFT", 6, 0)
+  hint:SetText("icon name…")
+  f.searchHint = hint
+
+  edit:SetScript("OnEditFocusGained", function() hint:Hide() end)
+  edit:SetScript("OnEditFocusLost", function()
+    if edit:GetText() == "" then hint:Show() end
+  end)
+  edit:SetScript("OnEscapePressed", function()
+    edit:ClearFocus()
+    if edit:GetText() ~= "" then
+      edit:SetText("")
+      hint:Show()
+      if f.ApplyFilter then f:ApplyFilter("") end
+    end
+  end)
+
+  local scroll = CreateFrame("ScrollFrame", "UltimaMacrosIconScroll", f, "UIPanelScrollFrameTemplate")
+  scroll:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -64)
+  scroll:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -28, 12)
+
+  local content = CreateFrame("Frame", "UltimaMacrosIconGrid", scroll)
+  content:SetWidth(320); content:SetHeight(300)
+  scroll:SetScrollChild(content)
+
+  f.scroll = scroll
+  f.content = content
+
+  local COLS = 8
+  local SIZE = 32
+  local PAD  = 6
+
+  function f:ApplyFilter(query)
+    query = string.lower(query or "")
+    local total = table.getn(UM_ICON_CHOICES)
+    local visible = {}
+
+    if query == "" then
+      for i = 1, total do visible[table.getn(visible)+1] = i end
+    else
+      for i = 1, total do
+        local tex = UM_ICON_CHOICES[i]
+        local base = UM_IconBasename(tex)
+        if string.find(base, query, 1, true) then
+          visible[table.getn(visible)+1] = i
+        end
+      end
+    end
+
+    local n = table.getn(visible)
+    local rows = math.ceil(n / COLS)
+    local contentH = rows * (SIZE + PAD) + PAD
+    content:SetHeight(contentH)
+
+    local shownSet = {}
+    for vi = 1, n do
+      local idx = visible[vi]
+      local btn = getglobal("UltimaMacrosIconCell"..idx)
+      if btn then
+        local row = math.floor((vi-1) / COLS)
+        local col = math.mod(vi-1, COLS)
+        btn:ClearAllPoints()
+        btn:SetPoint("TOPLEFT", content, "TOPLEFT",
+                     PAD + col * (SIZE + PAD),
+                     -PAD - row * (SIZE + PAD))
+        btn:Show()
+        shownSet[idx] = true
+      end
+    end
+
+    for i = 1, total do
+      if not shownSet[i] then
+        local btn = getglobal("UltimaMacrosIconCell"..i)
+        if btn then btn:Hide() end
+      end
+    end
+  end
+
+  function f:Rebuild(nm)
+    local rec = nm and UM_Get(nm)
+    UM_RebuildIconChoices()
+
+    local total = table.getn(UM_ICON_CHOICES)
+
+    for i = 1, total do
+      local btn = getglobal("UltimaMacrosIconCell"..i)
+      if not btn then
+        btn = CreateFrame("Button", "UltimaMacrosIconCell"..i, content)
+        btn:SetWidth(SIZE); btn:SetHeight(SIZE)
+        btn.icon = btn:CreateTexture(nil, "BACKGROUND")
+        btn.icon:SetAllPoints(btn)
+        btn:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+        btn:SetScript("OnClick", function()
+          local tex = this._tex
+          local name = UltimaMacrosFrameNameEdit and UltimaMacrosFrameNameEdit:GetText() or ""
+          if name == "" then return end
+          local r = UM_Get(name); if not r then return end
+          r.icon = tex
+          if UltimaMacrosIconButton then
+            UltimaMacrosIconButton:SetNormalTexture(UM_TexturePath(tex))
+          end
+          UM_RefreshAllSlotsForName(name)
+          UM_CloseIconPicker()
+        end)
+      end
+      local tex = UM_ICON_CHOICES[i]
+      btn._tex = tex
+      btn.icon:SetTexture(UM_TexturePath(tex))
+    end
+
+    local i2 = total + 1
+    while true do
+      local extra = getglobal("UltimaMacrosIconCell"..i2)
+      if not extra then break end
+      extra:Hide()
+      i2 = i2 + 1
+    end
+
+    local q = f.searchBox and f.searchBox:GetText() or ""
+    if q == "" then f.searchHint:Show() else f.searchHint:Hide() end
+    f:ApplyFilter(q or "")
+  end
+
+  tinsert(UISpecialFrames, "UltimaMacrosIconPicker")
+
+  UM_IconPicker = f
+  return f
+end
+
+local function UM_OpenIconPicker(anchorFrame)
+  local f = UM_EnsureIconPicker()
+  f:ClearAllPoints()
+  if anchorFrame then
+    f:SetPoint("TOPLEFT", anchorFrame, "BOTTOMLEFT", -8, -8)
+  else
+    f:SetPoint("CENTER")
+  end
+  f:Show()
+  local nm = (UltimaMacrosFrameNameEdit and UltimaMacrosFrameNameEdit:GetText()) or ""
+  f:Rebuild(nm)
+end
 function UM_BuildGUI()
   if UM_LocalUI and UM_LocalUI.frame then return end
   UM_LocalUI = UM_LocalUI or {}
@@ -1073,17 +1348,8 @@ function UM_BuildGUI()
   iconBtn:RegisterForDrag("LeftButton")
   iconBtn._idx = 1
   iconBtn:SetScript("OnClick", function()
-  local nm = (UltimaMacrosFrameNameEdit and UltimaMacrosFrameNameEdit:GetText()) or ""
-  if nm == "" then return end
-    local rec = UM_Get(nm); if not rec then return end
-    iconBtn._idx = (iconBtn._idx or 1) + 1
-    local total = table.getn(UM_ICON_CHOICES)
-    if iconBtn._idx > total then iconBtn._idx = 1 end
-      local choice = UM_ICON_CHOICES[iconBtn._idx]
-      rec.icon = choice
-      iconBtn:SetNormalTexture(UM_TexturePath(choice))
-      UM_RefreshAllSlotsForName(nm)
-      end)
+  UM_OpenIconPicker(iconBtn)
+end)
   iconBtn:SetScript("OnDragStart", function()
   local nm = UltimaMacrosFrameNameEdit:GetText() or ""
   UM_StartDrag(nm)
@@ -1249,6 +1515,7 @@ function UM_BuildGUI()
   f:SetScript("OnShow", function()
     if UM_UI_RefreshList then UM_UI_RefreshList() end
     if UM_UI_UpdateCounter then UM_UI_UpdateCounter() end
+    if UM_RebuildIconChoices then UM_RebuildIconChoices() end
   end)
 end
 
@@ -1272,6 +1539,7 @@ UM_EventFrame:SetScript("OnEvent", function()
 
     if UM_UI_RefreshList then UM_UI_RefreshList() end
     if UM_UI_UpdateCounter then UM_UI_UpdateCounter() end
+    if UM_RebuildIconChoices then UM_RebuildIconChoices() end
     if UM_UI_FixButtonLabels then UM_UI_FixButtonLabels() end
 
   elseif event == "ADDON_LOADED" then
