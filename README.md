@@ -9,6 +9,7 @@ UltimaMacros:
 - Lets you drag macros directly to your action bars.
 - Refreshes icons, names, and tooltips immediately when you save or edit a macro.
 - Offers a modernized editor with character count and simple focus/keyboard navigation.
+- Any icon from your spells, gear, or blizzard macros can be seen in the icon picker grid.
 
 ---
 
@@ -24,7 +25,8 @@ UltimaMacros:
   - Tab/Enter navigation
   - Esc to clear focus (press Esc again to close the window)
   - Live character counter
-
+  - Grid-style icon picker with access to icons from your gear, spells and blizzard macros
+  
 ---
 
 ## ⚙️ Installation
@@ -103,11 +105,15 @@ Executes a saved macro directly by name.
 - Macros made here do **not** appear in the default Blizzard macro UI.
 - Action buttons use the chosen icon or Blizzard’s standard fallback if the macro can’t resolve an automatic texture.
 - Only the UltimaMacros editor can create and edit these macros.
-- Only a few icon selections are available at the moment.
+- Icon Picker only includes icons from spells, abilities, gear, and blizzard macros.
 
 ---
 
 ## 📜 Changelog
+
+### v1.0.1
+- First release with
+  - Icon Grid Picker
 
 ### v1.0.0
 - First release with:
