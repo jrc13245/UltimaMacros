@@ -407,10 +407,32 @@ UM_RefreshActionButtonsForSlot = function(slot)
   if ActionBar_UpdateState then ActionBar_UpdateState() end
 end
 
--- ----- SuperMacro-like proxy pickup -----
+-- At module level, check what's available
 local UM_oldPickupMacro, UM_oldEditMacro, UM_oldGetMacroInfo, UM_oldCreateMacro
 local UM_oldActionButton_OnClick, UM_oldActionButton_OnReceiveDrag
+local UM_oldGetActionInfo = GetActionInfo  -- Will be nil in vanilla
+local UM_oldGetMacroIndexByName = GetMacroIndexByName
 local UM_proxyMacroIndex = nil
+
+-- Helper to check if slot has a real action (vanilla-compatible)
+local function UM_SlotHasRealAction(slot)
+  -- If GetActionInfo exists (TBC+), use it
+  if UM_oldGetActionInfo then
+    local actionType, actionID = UM_oldGetActionInfo(slot)
+    return (actionType and actionType ~= "")
+  end
+
+  -- Vanilla fallback: check if HasAction returns true and it's NOT our mapping
+  if HasAction and HasAction(slot) then
+    -- If we have a mapping for this slot, it's not a "real" action
+    if UM_GetMappedName(slot) then
+      return false
+    end
+    return true
+  end
+
+  return false
+end
 
 -- ----- Robust proxy macro pickup (handles multiple CreateMacro signatures) -----
 -- Some Vanilla cores want: CreateMacro(name, iconIndex, body, local, perCharacter)
@@ -476,10 +498,25 @@ local function UM_GetOrCreateProxyMacroIndex()
 end
 
 local function UM_PickupUsingMacroProxy()
-  if not UM_oldPickupMacro then return false end
-  local idx = UM_GetOrCreateProxyMacroIndex()
+  if not UM_oldPickupMacro or not UM_oldEditMacro then return false end
+
+  -- Try to reuse any existing macro at slot 1 without creating new ones
+  if UM_oldGetMacroInfo and UM_oldGetMacroInfo(1) then
+    local ok = pcall(UM_oldPickupMacro, 1)
+    return ok and true or false
+  end
+
+  -- Only create if absolutely necessary, and clean up immediately
+  local idx = UM_SafeCreateMacro("UMProxy", 1, " ")
   if not idx then return false end
+
   local ok = pcall(UM_oldPickupMacro, idx)
+
+  -- Clean up the proxy macro immediately after pickup
+  if DeleteMacro and idx then
+    pcall(DeleteMacro, idx)
+  end
+
   return ok and true or false
 end
 
@@ -590,46 +627,84 @@ local function UM_EnableSCMCompat()
   if UM_SCM_compat_enabled then return end
   UM_SCM_compat_enabled = true
 
-  -- Save originals once
-  UM_oldGetActionInfo       = UM_oldGetActionInfo       or GetActionInfo
-  UM_oldGetMacroInfo        = UM_oldGetMacroInfo        or GetMacroInfo
-  UM_oldGetMacroIndexByName = UM_oldGetMacroIndexByName or GetMacroIndexByName
-
-  -- 1) Report UM-mapped slots as “macro” with a stable virtual id (slot-space)
-  GetActionInfo = function(slot)
-    local name = UM_GetMappedName and UM_GetMappedName(slot)
-    if name then
-      return "macro", (UM_SCM_SLOT_BASE + slot), nil
-    end
-    return UM_oldGetActionInfo and UM_oldGetActionInfo(slot) or nil
+  if not UM_oldGetMacroInfo then
+    UM_oldGetMacroInfo = GetMacroInfo
   end
 
-  -- 2) Make GetMacroIndexByName(name) return a **virtual id** for UM macros (name-space)
-  GetMacroIndexByName = function(name)
-    if name and UM_FindIndexByName then
-      local idx = UM_FindIndexByName(name)
-      if idx then
-        return UM_AssignNameIndex(name)
+  -- Only hook GetActionInfo if it exists (TBC+)
+  if GetActionInfo then
+    if not UM_oldGetActionInfo then
+      UM_oldGetActionInfo = GetActionInfo
+    end
+
+    GetActionInfo = function(slot)
+      local realType, realID = UM_oldGetActionInfo(slot)
+      if realType and realType ~= "" then
+        return realType, realID, nil
       end
+
+      local name = UM_GetMappedName and UM_GetMappedName(slot)
+      if name then
+        return "macro", (UM_SCM_SLOT_BASE + slot), nil
+      end
+
+      return nil
     end
-    return UM_oldGetMacroIndexByName(name)
   end
 
-  -- 3) Serve GetMacroInfo for both virtual id spaces (slot & name)
+  -- Only hook GetMacroIndexByName if it exists
+  if GetMacroIndexByName then
+    if not UM_oldGetMacroIndexByName then
+      UM_oldGetMacroIndexByName = GetMacroIndexByName
+    end
+
+    GetMacroIndexByName = function(name)
+      if name and UM_FindIndexByName then
+        local idx = UM_FindIndexByName(name)
+        if idx then
+          return UM_AssignNameIndex(name)
+        end
+      end
+      return UM_oldGetMacroIndexByName(name)
+    end
+  end
+
   GetMacroInfo = function(index)
     local vname = UM_NameFromVirtualIndex(index)
     if vname then
       local rec = UM_Get and UM_Get(vname)
-      if not rec then return nil end  -- ADDED: nil guard
+      if not rec then return nil end
       local iconTex = UM_GetIconFor and UM_GetIconFor(vname) or "Interface\\Icons\\INV_Misc_QuestionMark"
       local body = (rec and rec.text) or ""
       return vname, iconTex, body
     end
-    -- ADDED: verify return value
     local name, tex, body = UM_oldGetMacroInfo(index)
     if not name then return nil end
     return name, tex, body
   end
+end
+
+-- At initialization, create a single persistent proxy
+local function UM_EnsureProxyMacro()
+  if UM_proxyMacroIndex and UM_oldGetMacroInfo and UM_oldGetMacroInfo(UM_proxyMacroIndex) then
+    return UM_proxyMacroIndex
+  end
+
+  -- Look for existing UMProxy
+  if UM_oldGetMacroIndexByName then
+    local idx = UM_oldGetMacroIndexByName("UMProxy")
+    if idx then
+      UM_proxyMacroIndex = idx
+      return idx
+    end
+  end
+
+  -- Create permanent proxy
+  local idx = UM_SafeCreateMacro("UMProxy", 1, "#showtooltip")
+  if idx then
+    UM_proxyMacroIndex = idx
+  end
+  return idx
 end
 
 -- ----- Hooks: map your macro to action bar, render icon/name, run on press -----
@@ -637,24 +712,34 @@ local function UM_InstallHooks()
   if UM_HooksInstalled then return end
   UM_HooksInstalled = true
 
-  UM_oldPickupMacro       = PickupMacro
-  UM_oldEditMacro         = EditMacro
-  UM_oldGetMacroInfo      = GetMacroInfo
-  UM_oldCreateMacro       = CreateMacro
+  UM_oldPickupMacro = PickupMacro
+  UM_oldEditMacro = EditMacro
+  UM_oldGetMacroInfo = GetMacroInfo
+  UM_oldCreateMacro = CreateMacro
 
-  local UM_oldPlaceAction   = PlaceAction
-  local UM_oldUseAction     = UseAction
-  local UM_oldPickupAction  = PickupAction
+  local UM_oldPlaceAction = PlaceAction
+  local UM_oldUseAction = UseAction
+  local UM_oldPickupAction = PickupAction
   local UM_oldGetActionText = GetActionText
-  local UM_oldGetActionTex  = GetActionTexture
-  UM_oldActionButton_OnClick       = ActionButton_OnClick
+  local UM_oldGetActionTex = GetActionTexture
+  local UM_oldHasAction = HasAction
+  -- DON'T save UM_oldGetActionInfo here - it's already saved in SCM compat
+  UM_oldActionButton_OnClick = ActionButton_OnClick
   UM_oldActionButton_OnReceiveDrag = ActionButton_OnReceiveDrag
 
   PlaceAction = function(slot)
     if UM_CURSOR then
-      UM_SetAction(slot, UM_CURSOR)
+      local macroName = UM_CURSOR
       UM_CURSOR = nil
       ClearCursor()
+
+      -- Check if there's a REAL action here
+      if UM_SlotHasRealAction(slot) then
+        DEFAULT_CHAT_FRAME:AddMessage("|cffff5555UltimaMacros: Slot " .. slot .. " is occupied!|r")
+        return
+      end
+
+      UM_SetAction(slot, macroName)
       UM_RefreshActionButtonsForSlot(slot)
       return
     end
@@ -676,10 +761,10 @@ local function UM_InstallHooks()
       UM_CURSOR = name
       UM_ClearAction(slot)
       UM_RefreshActionButtonsForSlot(slot)
-      if not UM_PickupUsingMacroProxy then return end
-      if not UM_PickupUsingMacroProxy() then
-        UM_PickupProxyForDrag_Fallback()
+      if UM_PickupUsingMacroProxy and UM_PickupUsingMacroProxy() then
+        return
       end
+      UM_PickupProxyForDrag_Fallback()
       return
     end
     return UM_oldPickupAction(slot)
@@ -694,23 +779,39 @@ local function UM_InstallHooks()
   GetActionTexture = function(slot)
     local name = UM_GetMappedName(slot)
     if name then
-      -- Try Blizzard/SCM dynamic resolution (#showtooltip) first
       local tex = UM_oldGetActionTex and UM_oldGetActionTex(slot)
       if tex then return tex end
-      -- Fallback so we never show a blank icon
       return UM_GetIconFor(name)
     end
     return UM_oldGetActionTex and UM_oldGetActionTex(slot) or nil
   end
 
-  -- Click-to-place while a drag is active
+  -- Check real actions FIRST before claiming slots
+  GetActionInfo = function(slot)
+    local realType, realID = UM_oldGetActionInfo(slot)
+    if realType and realType ~= "" then
+      return realType, realID, nil
+    end
+
+    local name = UM_GetMappedName and UM_GetMappedName(slot)
+    if name then
+      return "macro", (UM_SCM_SLOT_BASE + slot), nil
+    end
+    return nil
+  end
+
+  HasAction = function(slot)
+    local name = UM_GetMappedName(slot)
+    if name then return 1 end
+    return UM_oldHasAction(slot)
+  end
+
   ActionButton_OnClick = function(button)
     if UM_CURSOR then
       local btn = this or button
       local id = (ActionButton_GetPagedID and btn and ActionButton_GetPagedID(btn)) or (btn and btn.action)
       if id then
         PlaceAction(id)
-        UM_RefreshActionButtonsForSlot(id)
         return
       end
     end
@@ -719,14 +820,12 @@ local function UM_InstallHooks()
     end
   end
 
-  -- Drop-to-place (OnReceiveDrag) — ensure UM_CURSOR is still honored
   ActionButton_OnReceiveDrag = function()
     if UM_CURSOR then
       local btn = this
       local id = (ActionButton_GetPagedID and btn and ActionButton_GetPagedID(btn)) or (btn and btn.action)
       if id then
         PlaceAction(id)
-        UM_RefreshActionButtonsForSlot(id)
         return
       end
     end
