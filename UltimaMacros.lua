@@ -12,9 +12,18 @@ if not UltimaMacrosDB.account then UltimaMacrosDB.account = {} end
 if not UltimaMacrosDB.account.macros then UltimaMacrosDB.account.macros = {} end
 local UM_GetMappedName
 local UM_RefreshActionButtonsForSlot
+local UM_MappedSlots = {}
+local UM_IconChoicesBuilt = false
+local strlen = string.len
+local strsub = string.sub
+local strfind = string.find
+local strlower = string.lower
 
 -- UI scope state (editor checkbox): "char" or "account"
 local UM_UI_Scope = "char"
+local UM_LocalUI = {}
+local UM_hasUnsavedChanges = false
+local UM_PendingDelete = nil
 
 local function UM_GetCharKey()
   local name = UnitName("player")
@@ -107,18 +116,15 @@ local function UM_List()
   return out
 end
 
--- Re-index SCM/CleveRoids and repaint any slots mapped to this macro name
 local function UM_RefreshAllSlotsForName(name)
   if not name or name == "" then return end
 
-  -- Re-index SuperCleveroid/SuperMacro so #showtooltip parsing is up-to-date
   if CleveRoids and CleveRoids.Frame and CleveRoids.Frame.UPDATE_MACROS then
     pcall(CleveRoids.Frame.UPDATE_MACROS, CleveRoids.Frame)
     if CleveRoids.QueueActionUpdate then pcall(CleveRoids.QueueActionUpdate) end
   end
 
-  -- Refresh any actionbar slot mapped to this name (dynamic icon, tooltip, usable/cooldown/state)
-  for slot = 1, 120 do
+  for slot in pairs(UM_MappedSlots) do
     if UM_GetMappedName(slot) == name then
       if CleveRoids and CleveRoids.Frame and CleveRoids.Frame.ACTIONBAR_SLOT_CHANGED then
         pcall(CleveRoids.Frame.ACTIONBAR_SLOT_CHANGED, CleveRoids.Frame, slot)
@@ -269,14 +275,26 @@ local function UM_RunLine(line)
   local lower7 = string.lower(string.sub(line, 1, 7))
   if string.sub(lower7,1,7) == "/script" then
     local code = string.sub(line, 8)
-    if code and code ~= "" then RunScript(code) end
+    if code and code ~= "" then
+      -- ADDED: pcall protection
+      local success, err = pcall(RunScript, code)
+      if not success then
+        DEFAULT_CHAT_FRAME:AddMessage("|cffff5555UltimaMacros script error: "..tostring(err).."|r")
+      end
+    end
     return
   end
 
   local lower4 = string.lower(string.sub(line, 1, 4))
   if lower4 == "/run" then
     local code2 = string.sub(line, 5)
-    if code2 and code2 ~= "" then RunScript(code2) end
+    if code2 and code2 ~= "" then
+      -- ADDED: pcall protection
+      local success, err = pcall(RunScript, code2)
+      if not success then
+        DEFAULT_CHAT_FRAME:AddMessage("|cffff5555UltimaMacros script error: "..tostring(err).."|r")
+      end
+    end
     return
   end
 
@@ -324,10 +342,13 @@ end
 
 local function UM_SetAction(slot, name)
   UM_GetActionMap()[slot] = name
+  UM_MappedSlots[slot] = true
 end
+
 
 local function UM_ClearAction(slot)
   UM_GetActionMap()[slot] = nil
+  UM_MappedSlots[slot] = nil
 end
 
 local function UM_GetIconFor(name)
@@ -351,9 +372,6 @@ UM_RefreshActionButtonsForSlot = function(slot)
     local btn = getglobal(btnName)
     if btn and UM_ButtonMatchesSlot(btn, slot) then
       local name = UM_GetMappedName(slot)
-
-      -- Use the CURRENT GetActionTexture (our override defers to SCM for #showtooltip),
-      -- then fallback to UM’s saved static icon if it’s nil.
       local iconTex = GetActionTexture and GetActionTexture(slot)
       if not iconTex and name then
         iconTex = UM_GetIconFor(name)
@@ -376,8 +394,10 @@ UM_RefreshActionButtonsForSlot = function(slot)
 
   for i=1,12 do touch("ActionButton"..i) end
   for i=1,12 do touch("BonusActionButton"..i) end
+
+  -- FIXED: explicit iteration instead of table.getn(bars)
   local bars = { "MultiBarRight", "MultiBarLeft", "MultiBarBottomLeft", "MultiBarBottomRight" }
-  for bi=1, table.getn(bars) do
+  for bi=1, 4 do  -- Changed from: for bi=1, table.getn(bars) do
     local bar = bars[bi]
     for i=1,12 do touch(bar.."Button"..i) end
   end
@@ -493,8 +513,7 @@ local function UM_PickupProxyForDrag_Fallback()
   return false
 end
 
--- Public drag API for UI (no OnDragStop clearing!)
-function UM_StartDrag(name)
+local function UM_StartDrag(name)
   if not name or name == "" or not UM_Get(name) then return end
   UM_CURSOR = name
   ClearCursor()
@@ -504,7 +523,7 @@ function UM_StartDrag(name)
   DEFAULT_CHAT_FRAME:AddMessage("|cffff5555UltimaMacros: couldn't start drag (no valid pickup payload).|r")
 end
 
-function UM_EndDrag()
+local function UM_EndDrag()
   -- Intentionally NOT clearing UM_CURSOR here; the action button needs it.
   -- You can cancel a stuck cursor with right-click (Blizzard default).
 end
@@ -601,13 +620,15 @@ local function UM_EnableSCMCompat()
     local vname = UM_NameFromVirtualIndex(index)
     if vname then
       local rec = UM_Get and UM_Get(vname)
+      if not rec then return nil end  -- ADDED: nil guard
       local iconTex = UM_GetIconFor and UM_GetIconFor(vname) or "Interface\\Icons\\INV_Misc_QuestionMark"
       local body = (rec and rec.text) or ""
-      -- Vanilla returns (name, texture, body)
       return vname, iconTex, body
     end
-    -- Not one of ours → fall back to whatever (Blizzard or SuperMacro wrapper)
-    return UM_oldGetMacroInfo(index)
+    -- ADDED: verify return value
+    local name, tex, body = UM_oldGetMacroInfo(index)
+    if not name then return nil end
+    return name, tex, body
   end
 end
 
@@ -771,10 +792,7 @@ end
 -- ***********************
 local function UM_UI_FixButtonLabels()
   if UltimaMacrosNewCharButton then
-    UltimaMacrosNewCharButton:SetText("New (C)")
-  end
-  if UltimaMacrosNewAccountButton then
-    UltimaMacrosNewAccountButton:SetText("New (A)")
+    UltimaMacrosNewCharButton:SetText("New")
   end
   if UltimaMacrosSaveButton then
     UltimaMacrosSaveButton:SetText("Save")
@@ -819,31 +837,83 @@ function UM_UI_RefreshList()
     local tag  = (list[i]._scope == "account") and "[A] " or "[C] "
     btn:SetText(tag .. name)
 
-    -- normal click loads into editor
-    btn:SetScript("OnClick", function() UM_UI_LoadIntoEditor(name) end)
+    btn:SetScript("OnClick", function()
+      UM_UI_LoadIntoEditor(name)
+    end)
 
-    -- Left-drag from the list starts our drag (no Shift); no OnDragStop clearing
+    btn:SetScript("OnDoubleClick", function()
+      UM_UI_LoadIntoEditor(name)
+      if UltimaMacrosFrameEditBox then
+        UltimaMacrosFrameEditBox:SetFocus()
+      end
+    end)
+
     btn:RegisterForDrag("LeftButton")
     btn:SetScript("OnDragStart", function() UM_StartDrag(name) end)
+
+    btn:SetScript("OnEnter", function()
+      GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+      GameTooltip:SetText(name)
+      local scopeText = (list[i]._scope == "account") and "Account-wide" or "Character"
+      GameTooltip:AddLine("Scope: " .. scopeText, 0.7, 0.7, 0.7)
+      local charCount = string.len(list[i].text or "")
+      GameTooltip:AddLine(charCount .. "/2056 characters", 0.5, 0.5, 0.5)
+      GameTooltip:AddLine(" ", 1, 1, 1)
+      GameTooltip:AddLine("Double-click to edit", 0.3, 1, 0.3, true)
+      GameTooltip:AddLine("Drag to action bar", 0.3, 1, 0.3, true)
+      GameTooltip:Show()
+    end)
+    btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     btn:Show()
     offsetY = offsetY - 22
   end
 
-  UltimaMacrosListContent:SetHeight(math.max(330, -offsetY + 4))
+  -- Update content height based on number of items
+  local contentHeight = math.max(360, -offsetY + 4)
+  UltimaMacrosListContent:SetHeight(contentHeight)
+
+  -- Force scroll frame to update its scroll range
+  UltimaMacrosListScroll:UpdateScrollChildRect()
+
+  -- Reset scroll position if we're scrolled past the new content
+  local maxScroll = math.max(0, contentHeight - UltimaMacrosListScroll:GetHeight())
+  local currentScroll = UltimaMacrosListScroll:GetVerticalScroll()
+  if currentScroll > maxScroll then
+    UltimaMacrosListScroll:SetVerticalScroll(maxScroll)
+  end
+
   UM_UI_FixButtonLabels()
 end
 
 function UM_UI_LoadIntoEditor(name)
   local m, scope = UM_Get(name)
   if not m then return end
+
   UltimaMacrosFrameNameEdit:SetText(m.name or "")
   UltimaMacrosFrameEditBox:SetText(m.text or "")
   UM_UI_Scope = scope or "char"
+
+  -- Update scope display
   if UltimaMacrosScopeCheck then
     UltimaMacrosScopeCheck:SetChecked(UM_UI_Scope == "char")
-    UltimaMacrosScopeCheckText:SetText((UM_UI_Scope == "char") and "Per Character" or "Per Account")
+    if UM_UI_Scope == "char" then
+      UltimaMacrosScopeCheckText:SetText("Per Character (uncheck for Account-wide)")
+    else
+      UltimaMacrosScopeCheckText:SetText("Account-wide (check for Per Character)")
+    end
   end
+
+  if UM_LocalUI.scopeIndicator then
+    if UM_UI_Scope == "char" then
+      UM_LocalUI.scopeIndicator:SetText("[Char]")
+      UM_LocalUI.scopeIndicator:SetTextColor(0.3, 0.8, 1.0)
+    else
+      UM_LocalUI.scopeIndicator:SetText("[Account]")
+      UM_LocalUI.scopeIndicator:SetTextColor(1.0, 0.8, 0.3)
+    end
+  end
+
   if UltimaMacrosIconButton then
     local icon = (m.icon and m.icon ~= "") and m.icon or UM_DEFAULT_ICON
     UltimaMacrosIconButton:SetNormalTexture(UM_TexturePath(icon))
@@ -853,7 +923,20 @@ function UM_UI_LoadIntoEditor(name)
     end
     UltimaMacrosIconButton._idx = found
   end
+
+  UM_hasUnsavedChanges = false
+  if UM_LocalUI.counter then
+    UM_LocalUI.counter:SetTextColor(1, 1, 1)
+  end
   UM_UI_UpdateCounter()
+
+  if UltimaMacrosEditScroll and UltimaMacrosEditScroll.UpdateScrollChildRect then
+    UltimaMacrosEditScroll:UpdateScrollChildRect()
+  end
+  -- Reset scroll to top when loading a new macro
+  if UltimaMacrosEditScroll then
+    UltimaMacrosEditScroll:SetVerticalScroll(0)
+  end
 end
 
 function UM_UI_ClearEditor()
@@ -880,6 +963,12 @@ function UM_UI_Save()
   end
   UM_Save(name, text, UM_UI_Scope)
   UM_UI_RefreshList()
+
+  -- Clear unsaved changes flag
+  UM_hasUnsavedChanges = false
+  if UM_LocalUI.counter then
+    UM_LocalUI.counter:SetTextColor(1, 1, 1) -- White when clean
+  end
 end
 
 function UM_UI_Run()
@@ -919,7 +1008,31 @@ end
 function UM_UI_Delete()
   local name = UltimaMacrosFrameNameEdit:GetText() or ""
   if name == "" then return end
-  UM_Delete(name)
+
+  UM_PendingDelete = name
+
+  -- Create confirmation dialog
+  if not StaticPopupDialogs["ULTIMAMACROS_DELETE_CONFIRM"] then
+    StaticPopupDialogs["ULTIMAMACROS_DELETE_CONFIRM"] = {
+      text = "Delete macro '%s'?",
+      button1 = "Delete",
+      button2 = "Cancel",
+      OnAccept = function()
+        if UM_PendingDelete then
+          UM_Delete(UM_PendingDelete)
+          UM_PendingDelete = nil
+        end
+      end,
+      OnCancel = function()
+        UM_PendingDelete = nil
+      end,
+      timeout = 0,
+      whileDead = true,
+      hideOnEscape = true,
+    }
+  end
+
+  StaticPopup_Show("ULTIMAMACROS_DELETE_CONFIRM", name)
 end
 
 function UM_UI_OnTextChanged()
@@ -944,10 +1057,18 @@ function UM_UI_ToggleScope()
   local checked = UltimaMacrosScopeCheck:GetChecked()
   if checked then
     UM_UI_Scope = "char"
-    UltimaMacrosScopeCheckText:SetText("Per Character")
+    UltimaMacrosScopeCheckText:SetText("Per Character (uncheck for Account-wide)")
+    if UM_LocalUI.scopeIndicator then
+      UM_LocalUI.scopeIndicator:SetText("[Char]")
+      UM_LocalUI.scopeIndicator:SetTextColor(0.3, 0.8, 1.0)
+    end
   else
     UM_UI_Scope = "account"
-    UltimaMacrosScopeCheckText:SetText("Per Account")
+    UltimaMacrosScopeCheckText:SetText("Account-wide (check for Per Character)")
+    if UM_LocalUI.scopeIndicator then
+      UM_LocalUI.scopeIndicator:SetText("[Account]")
+      UM_LocalUI.scopeIndicator:SetTextColor(1.0, 0.8, 0.3)
+    end
   end
 end
 
@@ -964,18 +1085,16 @@ end
 
 local function UM_IconBasename(tex)
   if not tex or tex == "" then return "" end
-  local s = tex
-  local i = string.find(s, "Icons\\", 1, true)
-  if i then s = string.sub(s, i + 6) end
-  local slash = string.find(s, "\\[^\\]*$")
-  if slash then s = string.sub(s, slash + 1) end
-  local dot = string.find(s, "%.[^%.]*$")
-  if dot then s = string.sub(s, 1, dot - 1) end
+  -- OPTIMIZED: use gsub instead of multiple find/sub calls
+  local s = string.gsub(tex, "^.*\\Icons\\", "")
+  s = string.gsub(s, "\\.*", "")
+  s = string.gsub(s, "%..*", "")
   return string.lower(s or "")
 end
 
 -- Rebuild the icon list by scanning spells, items, and macros.
 local function UM_RebuildIconChoices()
+  if UM_IconChoicesBuilt then return end
   local seen, out = {}, {}
 
   local function add(tex)
@@ -1034,12 +1153,12 @@ local function UM_RebuildIconChoices()
   if table.getn(out) > 0 then
     UM_ICON_CHOICES = out -- full texture paths now
   end
+  UM_IconChoicesBuilt = true
 end
 
 -- ===========================
 -- Pure-Lua UI (no XML needed)
 -- ===========================
-local UM_LocalUI = {}  -- local namespace for UI locals
 
 local function UM_SkinFrame(frame)
   frame:SetBackdrop({
@@ -1048,6 +1167,21 @@ local function UM_SkinFrame(frame)
     tile = true, tileSize = 32, edgeSize = 32,
     insets = { left = 11, right = 12, top = 12, bottom = 11 },
   })
+end
+
+-- Helper: Create section header with divider line
+local function UM_CreateSectionHeader(parent, text, yOffset)
+  local header = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  header:SetPoint("TOPLEFT", parent, "TOPLEFT", 12, yOffset)
+  header:SetText(text)
+
+  local line = parent:CreateTexture(nil, "ARTWORK")
+  line:SetHeight(1)
+  line:SetPoint("LEFT", header, "BOTTOMLEFT", 0, -2)
+  line:SetPoint("RIGHT", parent, "RIGHT", -12, 0)
+  line:SetTexture(0.5, 0.5, 0.5, 0.5)
+
+  return header
 end
 
 -- ============================================================
@@ -1070,10 +1204,13 @@ local function UM_EnsureIconPicker()
                   insets={ left=4, right=4, top=4, bottom=4 } })
   f:SetBackdropColor(0,0,0,0.9)
   f:SetBackdropBorderColor(0.3,0.3,0.3,1)
-  f:SetMovable(true); f:EnableMouse(true)
+  f:SetMovable(true)
+  f:EnableMouse(true)
   f:RegisterForDrag("LeftButton")
-  f:SetScript("OnDragStart", function() this:StartMoving() end)
-  f:SetScript("OnDragStop", function() this:StopMovingOrSizing() end)
+  f:SetScript("OnDragStart", function() f:StartMoving() end)  -- Changed from this to f
+  f:SetScript("OnDragStop", function() f:StopMovingOrSizing() end)  -- Changed from this to f
+  f:SetFrameStrata("DIALOG")  -- ADD THIS - ensures it's above the main frame
+  f:SetToplevel(true)  -- ADD THIS - makes it independently clickable
 
   local t = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
   t:SetPoint("TOP", 0, -10)
@@ -1097,9 +1234,17 @@ local function UM_EnsureIconPicker()
 
   local hint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
   hint:SetPoint("LEFT", edit, "LEFT", 6, 0)
-  hint:SetText("icon name…")
+  hint:SetText("icon name...")
   f.searchHint = hint
 
+  edit:SetScript("OnTextChanged", function()
+    if strlen(this:GetText()) == 0 then
+      f.searchHint:Show()
+    else
+      f.searchHint:Hide()
+    end
+    f:ApplyFilter(this:GetText())
+  end)
   edit:SetScript("OnEditFocusGained", function() hint:Hide() end)
   edit:SetScript("OnEditFocusLost", function()
     if edit:GetText() == "" then hint:Show() end
@@ -1123,6 +1268,27 @@ local function UM_EnsureIconPicker()
 
   f.scroll = scroll
   f.content = content
+
+  -- ADD MOUSE WHEEL SCROLLING
+  local function UM_IconPickerWheelScroll(delta)
+    if ScrollFrameTemplate_OnMouseWheel then
+      local oldThis = this
+      this = scroll
+      ScrollFrameTemplate_OnMouseWheel(delta or 0)
+      this = oldThis
+    else
+      local bar = getglobal(scroll:GetName() .. "ScrollBar")
+      if bar then
+        local step = (bar:GetValueStep() or 20) * 3
+        bar:SetValue((bar:GetValue() or 0) - (delta or 0) * step)
+      end
+    end
+  end
+
+  scroll:EnableMouseWheel(true)
+  scroll:SetScript("OnMouseWheel", function()
+    UM_IconPickerWheelScroll(arg1 or 0)
+  end)
 
   local COLS = 8
   local SIZE = 32
@@ -1149,6 +1315,11 @@ local function UM_EnsureIconPicker()
     local rows = math.ceil(n / COLS)
     local contentH = rows * (SIZE + PAD) + PAD
     content:SetHeight(contentH)
+
+    -- Update scroll frame
+    if scroll.UpdateScrollChildRect then
+      scroll:UpdateScrollChildRect()
+    end
 
     local shownSet = {}
     for vi = 1, n do
@@ -1237,12 +1408,15 @@ local function UM_OpenIconPicker(anchorFrame)
   local nm = (UltimaMacrosFrameNameEdit and UltimaMacrosFrameNameEdit:GetText()) or ""
   f:Rebuild(nm)
 end
+
+-- ============================================================
+-- Main UI
+-- ============================================================
 function UM_BuildGUI()
   if UM_LocalUI and UM_LocalUI.frame then return end
-  UM_LocalUI = UM_LocalUI or {}
 
   local f = CreateFrame("Frame", "UltimaMacrosFrame", UIParent)
-  f:SetWidth(700); f:SetHeight(440)
+  f:SetWidth(720); f:SetHeight(470)
 
   if UltimaMacrosDB and UltimaMacrosDB.pos then
     f:ClearAllPoints()
@@ -1261,30 +1435,29 @@ function UM_BuildGUI()
     local p, _, rp, x, y = f:GetPoint()
     UltimaMacrosDB.pos = { p = p, rp = rp, x = x, y = y }
   end)
-  -- after you build the widgets inside UM_BuildGUI(), add:
   f:SetScript("OnHide", function()
     f:StopMovingOrSizing()
     if UltimaMacrosFrameNameEdit then UltimaMacrosFrameNameEdit:ClearFocus() end
     if UltimaMacrosFrameEditBox then UltimaMacrosFrameEditBox:ClearFocus() end
   end)
 
-
   UM_SkinFrame(f)
   f:Hide()
   UM_LocalUI.frame = f
 
   if UISpecialFrames then tinsert(UISpecialFrames, "UltimaMacrosFrame") end
-
   if UIPanelWindows then
     UIPanelWindows[f:GetName()] = { area = "center", pushable = 1 }
   end
 
+  -- Title
   local title = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
   title:SetPoint("TOP", f, "TOP", 0, -16)
   title:SetText("UltimaMacros")
 
+  -- Drag area
   local drag = CreateFrame("Frame", nil, f)
-  drag:SetWidth(660); drag:SetHeight(26)
+  drag:SetWidth(680); drag:SetHeight(26)
   drag:SetPoint("TOP", f, "TOP", 0, -12)
   drag:EnableMouse(true)
   drag:RegisterForDrag("LeftButton")
@@ -1295,96 +1468,141 @@ function UM_BuildGUI()
     UltimaMacrosDB.pos = { p = p, rp = rp, x = x, y = y }
   end)
 
+  -- Close button
   local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
   close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -6, -6)
   close:SetScript("OnClick", function() HideUIPanel(f) end)
 
+  -- ===== LEFT SIDE: Macro List =====
+  local macrosHeader = UM_CreateSectionHeader(f, "Macros", -50)
+
   local listScroll = CreateFrame("ScrollFrame", "UltimaMacrosListScroll", f, "UIPanelScrollFrameTemplate")
-  listScroll:SetWidth(150); listScroll:SetHeight(310)
-  listScroll:SetPoint("TOPLEFT", f, "TOPLEFT", 8, -72)
+  listScroll:SetWidth(150); listScroll:SetHeight(360)
+  listScroll:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -70)
 
   local listContent = CreateFrame("Frame", "UltimaMacrosListContent", listScroll)
-  listContent:SetWidth(150); listContent:SetHeight(310)
+  listContent:SetWidth(150); listContent:SetHeight(360)
   listContent:SetPoint("TOPLEFT", listScroll, "TOPLEFT", 0, 0)
   listScroll:SetScrollChild(listContent)
 
-  -- Name box
+  -- ===== RIGHT SIDE: Editor =====
+  local editorHeader = UM_CreateSectionHeader(f, "Editor", -50)
+  editorHeader:ClearAllPoints()
+  editorHeader:SetPoint("TOPLEFT", f, "TOPLEFT", 200, -50)
+
+  -- Name field
+  local nameLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  nameLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 200, -68)
+  nameLabel:SetText("Name:")
+
   local nameEdit = CreateFrame("EditBox", "UltimaMacrosFrameNameEdit", f, "InputBoxTemplate")
-  nameEdit:SetWidth(380); nameEdit:SetHeight(20)
-  nameEdit:SetPoint("TOPLEFT", f, "TOPLEFT", 205, -44)
+  nameEdit:SetWidth(360); nameEdit:SetHeight(20)
+  nameEdit:SetPoint("TOPLEFT", nameLabel, "BOTTOMLEFT", 5, -4)
   nameEdit:SetAutoFocus(false)
   nameEdit:EnableMouse(true)
   nameEdit:EnableKeyboard(true)
   if nameEdit.SetMaxLetters then nameEdit:SetMaxLetters(64) end
   nameEdit:SetTextInsets(8, 8, 2, 2)
 
-  -- Click → focus name field (Vanilla: use 'this', not 'self')
   nameEdit:SetScript("OnMouseDown", function() this:SetFocus() end)
-
-  -- Enter/Tab → jump to body
   nameEdit:SetScript("OnEnterPressed", function()
-  if UltimaMacrosFrameEditBox then UltimaMacrosFrameEditBox:SetFocus() end
-    end)
+    if UltimaMacrosFrameEditBox then UltimaMacrosFrameEditBox:SetFocus() end
+  end)
   nameEdit:SetScript("OnTabPressed", function()
-  if UltimaMacrosFrameEditBox then UltimaMacrosFrameEditBox:SetFocus() end
-    end)
-
-  -- Esc → clear focus (Esc again will close via UISpecialFrames)
+    if UltimaMacrosFrameEditBox then UltimaMacrosFrameEditBox:SetFocus() end
+  end)
   nameEdit:SetScript("OnEscapePressed", function() this:ClearFocus() end)
+  nameEdit:SetScript("OnKeyDown", function()
+    if arg1 == "S" and IsControlKeyDown() then
+      UM_UI_Save()
+    end
+  end)
 
-  local scopeCheck = CreateFrame("CheckButton", "UltimaMacrosScopeCheck", f, "UICheckButtonTemplate")
-  scopeCheck:SetPoint("LEFT", nameEdit, "RIGHT", 2, 0)
-  scopeCheck:SetChecked(true)
-  _G["UltimaMacrosScopeCheckText"] = f:CreateFontString("UltimaMacrosScopeCheckText", "OVERLAY", "GameFontHighlightSmall")
-  UltimaMacrosScopeCheckText:SetPoint("LEFT", scopeCheck, "RIGHT", 4, 0)
-  UltimaMacrosScopeCheckText:SetText("Per Character")
-  scopeCheck:SetScript("OnClick", function() if UM_UI_ToggleScope then UM_UI_ToggleScope() end end)
+  -- Scope indicator
+  local scopeIndicator = f:CreateFontString("UltimaMacrosScopeIndicator", "OVERLAY", "GameFontHighlight")
+  scopeIndicator:SetPoint("LEFT", nameEdit, "RIGHT", 8, 0)
+  scopeIndicator:SetText("[Char]")
+  scopeIndicator:SetTextColor(0.3, 0.8, 1.0)
 
-  -- Icon button (unchanged except for new anchor you picked)
+  -- Icon button
   local iconBtn = CreateFrame("Button", "UltimaMacrosIconButton", f)
-  iconBtn:SetWidth(22); iconBtn:SetHeight(22)
-  iconBtn:SetPoint("LEFT", UltimaMacrosScopeCheckText, "RIGHT", -37, -30)
+  iconBtn:SetWidth(36); iconBtn:SetHeight(36)
+  iconBtn:SetPoint("TOPLEFT", nameEdit, "BOTTOMLEFT", 0, -8)
   iconBtn:SetNormalTexture(UM_TexturePath(UM_DEFAULT_ICON))
+  iconBtn:SetBackdrop({
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    edgeSize = 12,
+    insets = { left = 2, right = 2, top = 2, bottom = 2 }
+  })
+  iconBtn:SetBackdropBorderColor(0.6, 0.6, 0.6, 1)
   iconBtn:RegisterForDrag("LeftButton")
   iconBtn._idx = 1
-  iconBtn:SetScript("OnClick", function()
-  UM_OpenIconPicker(iconBtn)
-end)
+
+  iconBtn:SetScript("OnClick", function() UM_OpenIconPicker(iconBtn) end)
   iconBtn:SetScript("OnDragStart", function()
-  local nm = UltimaMacrosFrameNameEdit:GetText() or ""
-  UM_StartDrag(nm)
+    local nm = UltimaMacrosFrameNameEdit:GetText() or ""
+    UM_StartDrag(nm)
   end)
+  iconBtn:SetScript("OnEnter", function()
+    GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
+    GameTooltip:SetText("Macro Icon")
+    GameTooltip:AddLine("Click to choose a different icon", 1, 1, 1, true)
+    GameTooltip:AddLine("Drag to place macro on action bar", 0.7, 0.7, 0.7, true)
+    GameTooltip:Show()
+  end)
+  iconBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+  local iconLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  iconLabel:SetPoint("LEFT", iconBtn, "RIGHT", 6, 0)
+  iconLabel:SetText("Icon (click to change, drag to action bar)")
+
+  -- Scope checkbox
+  local scopeCheck = CreateFrame("CheckButton", "UltimaMacrosScopeCheck", f, "UICheckButtonTemplate")
+  scopeCheck:SetPoint("TOPLEFT", iconBtn, "BOTTOMLEFT", -4, -8)
+  scopeCheck:SetChecked(true)
+
+  _G["UltimaMacrosScopeCheckText"] = f:CreateFontString("UltimaMacrosScopeCheckText", "OVERLAY", "GameFontHighlightSmall")
+  UltimaMacrosScopeCheckText:SetPoint("LEFT", scopeCheck, "RIGHT", 4, 0)
+  UltimaMacrosScopeCheckText:SetText("Per Character (uncheck for Account-wide)")
+  scopeCheck:SetScript("OnClick", function() if UM_UI_ToggleScope then UM_UI_ToggleScope() end end)
+
+  -- Buttons
+  local BTN_WIDTH = 70
+  local BTN_SPACING = 4
 
   local function makeBtn(name, label, parent)
     local b = CreateFrame("Button", name, parent, "UIPanelButtonTemplate")
-    b:SetWidth(80); b:SetHeight(22)
+    b:SetWidth(BTN_WIDTH); b:SetHeight(22)
     b:SetText(label)
     return b
   end
 
-  local newC = makeBtn("UltimaMacrosNewCharButton", "New (C)", f)
-  newC:SetPoint("TOPLEFT", nameEdit, "BOTTOMLEFT", 0, -10)
+  local newC = makeBtn("UltimaMacrosNewCharButton", "New", f)
+  newC:SetPoint("TOPLEFT", scopeCheck, "BOTTOMLEFT", 4, -10)
   newC:SetScript("OnClick", function() if UM_UI_NewChar then UM_UI_NewChar() end end)
 
-  local newA = makeBtn("UltimaMacrosNewAccountButton", "New (A)", f)
-  newA:SetPoint("LEFT", newC, "RIGHT", 5, 0)
-  newA:SetScript("OnClick", function() if UM_UI_NewAccount then UM_UI_NewAccount() end end)
-
   local save = makeBtn("UltimaMacrosSaveButton", "Save", f)
-  save:SetPoint("LEFT", newA, "RIGHT", 5, 0)
+  save:SetPoint("LEFT", newC, "RIGHT", BTN_SPACING, 0)
   save:SetScript("OnClick", function() if UM_UI_Save then UM_UI_Save() end end)
+  save:SetScript("OnEnter", function()
+    GameTooltip:SetOwner(this, "ANCHOR_TOP")
+    GameTooltip:SetText("Save Macro (Ctrl+S)")
+    GameTooltip:Show()
+  end)
+  save:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
   local run = makeBtn("UltimaMacrosRunButton", "Run", f)
-  run:SetPoint("LEFT", save, "RIGHT", 5, 0)
+  run:SetPoint("LEFT", save, "RIGHT", BTN_SPACING, 0)
   run:SetScript("OnClick", function() if UM_UI_Run then UM_UI_Run() end end)
 
   local del = makeBtn("UltimaMacrosDeleteButton", "Delete", f)
-  del:SetPoint("LEFT", run, "RIGHT", 5, 0)
+  del:SetPoint("LEFT", run, "RIGHT", BTN_SPACING, 0)
   del:SetScript("OnClick", function() if UM_UI_Delete then UM_UI_Delete() end end)
 
+  -- Editor background
   local editorBG = CreateFrame("Frame", "UltimaMacrosEditorBG", f)
-  editorBG:SetWidth(380); editorBG:SetHeight(300)
-  editorBG:SetPoint("TOPLEFT", newC, "BOTTOMLEFT", 0, -12)
+  editorBG:SetWidth(380); editorBG:SetHeight(230)
+  editorBG:SetPoint("TOPLEFT", newC, "BOTTOMLEFT", -4, -8)
   editorBG:SetBackdrop({
     bgFile  = "Interface\\Tooltips\\UI-Tooltip-Background",
     edgeFile= "Interface\\Tooltips\\UI-Tooltip-Border",
@@ -1393,77 +1611,66 @@ end)
   })
   editorBG:SetBackdropColor(0,0,0,0.8)
 
+  -- Character counter
   local counter = f:CreateFontString("UltimaMacrosFrameCounter", "OVERLAY", "GameFontHighlightSmall")
   counter:SetPoint("TOPRIGHT", editorBG, "BOTTOMRIGHT", -6, -4)
   counter:SetText("0/2056")
 
-  -- Body area: ScrollFrame + EditBox
+  -- EditBox with scroll
   local editScroll = CreateFrame("ScrollFrame", "UltimaMacrosEditScroll", f, "UIPanelScrollFrameTemplate")
-  editScroll:SetWidth(365); editScroll:SetHeight(280)
+  editScroll:SetWidth(360); editScroll:SetHeight(210)
   editScroll:SetPoint("TOPLEFT", editorBG, "TOPLEFT", 10, -10)
   editScroll:EnableMouse(true)
 
-  -- Create the EditBox BEFORE assigning as child
   local editBox = CreateFrame("EditBox", "UltimaMacrosFrameEditBox", editScroll)
   editBox:SetMultiLine(true)
-  editBox:SetWidth(380)
-
-  -- Give it a tall canvas so the scrollbar has range. (Big but cheap.)
-  editBox:SetHeight(2000)
-
-  -- Padding & font
+  editBox:SetWidth(360)
+  editBox:SetHeight(1200)
   editBox:SetTextInsets(6, 6, 4, 4)
   editBox:SetFontObject(ChatFontNormal)
-
-  -- Focus & input
   editBox:SetAutoFocus(false)
   editBox:EnableMouse(true)
   editBox:EnableKeyboard(true)
 
-  -- After setting the child, ensure the scrollable rect is correct
   editScroll:SetScrollChild(editBox)
   if editScroll.UpdateScrollChildRect then editScroll:UpdateScrollChildRect() end
 
   editBox:SetScript("OnTextChanged", function()
+    UM_hasUnsavedChanges = true
+    counter:SetTextColor(1, 0.8, 0)
+
     if UM_UI_OnTextChanged then UM_UI_OnTextChanged() end
     if UltimaMacrosEditScroll and UltimaMacrosEditScroll.UpdateScrollChildRect then
       UltimaMacrosEditScroll:UpdateScrollChildRect()
     else
-      UltimaMacrosEditScroll:SetScrollChild(editBox) -- fallback
+      UltimaMacrosEditScroll:SetScrollChild(editBox)
     end
   end)
 
-  -- Click inside → focus body
   editBox:SetScript("OnMouseDown", function() this:SetFocus() end)
-
-  -- Tab ↔ name field
   editBox:SetScript("OnTabPressed", function()
     if UltimaMacrosFrameNameEdit then UltimaMacrosFrameNameEdit:SetFocus() end
   end)
-
-  -- Esc → clear focus (Esc again closes via UISpecialFrames)
   editBox:SetScript("OnEscapePressed", function() this:ClearFocus() end)
+  editBox:SetScript("OnKeyDown", function()
+    if arg1 == "S" and IsControlKeyDown() then
+      UM_UI_Save()
+      this:ClearFocus()
+    end
+  end)
 
-  -- Keep caret in view while typing/navigating (1.12-safe, nil-guarded)
   editBox:SetScript("OnCursorChanged", function(x, y, w, h)
     local sf = UltimaMacrosEditScroll
     if not sf then return end
-
-    -- y/h can be nil briefly; bail out cleanly
     if not y or not h then
       if sf.UpdateScrollChildRect then sf:UpdateScrollChildRect() end
       return
     end
 
-    -- Convert caret coords to scroll offsets
     local view = sf:GetHeight() or 0
     local cur  = sf:GetVerticalScroll() or 0
-
-    -- In vanilla, y is negative as you go down; top-of-caret in scrollspace:
     local top    = -y
     local bottom = top + h
-
-    -- Clamp targets a bit inside the view (padding = 8)
     local PAD = 8
 
     if top < cur + PAD then
@@ -1473,44 +1680,36 @@ end)
     end
   end)
 
-  -- Helper: wheel scrolling that works on 1.12 templates
   local function UM_WheelScroll(sf, delta)
-    -- Prefer Blizzard's template on Vanilla, but set `this` first.
     if ScrollFrameTemplate_OnMouseWheel then
       local oldThis = this
       this = sf
-      ScrollFrameTemplate_OnMouseWheel(delta or 0)  -- Vanilla expects only the delta
+      ScrollFrameTemplate_OnMouseWheel(delta or 0)
       this = oldThis
       return
     end
-    -- Manual fallback: drive the scrollbar directly
     local bar = getglobal(sf:GetName() .. "ScrollBar")
     if not bar then return end
     local step = (bar:GetValueStep() or 20) * 3
     bar:SetValue((bar:GetValue() or 0) - (delta or 0) * step)
   end
 
-  -- Make sure both can receive wheel input
   editScroll:EnableMouseWheel(true)
   editBox:EnableMouseWheel(true)
-
-  -- Scroll on the scrollframe
   editScroll:SetScript("OnMouseWheel", function()
     UM_WheelScroll(this, arg1 or 0)
   end)
-
-  -- Scroll when the mouse is over the edit box
   editBox:SetScript("OnMouseWheel", function()
     UM_WheelScroll(UltimaMacrosEditScroll, arg1 or 0)
   end)
-
-  -- Click the scrollframe background → focus the edit box
   editScroll:SetScript("OnMouseDown", function()
     if UltimaMacrosFrameEditBox then UltimaMacrosFrameEditBox:SetFocus() end
   end)
 
   UM_LocalUI.listScroll  = listScroll
   UM_LocalUI.listContent = listContent
+  UM_LocalUI.scopeIndicator = scopeIndicator
+  UM_LocalUI.counter = counter
 
   f:SetScript("OnShow", function()
     if UM_UI_RefreshList then UM_UI_RefreshList() end
