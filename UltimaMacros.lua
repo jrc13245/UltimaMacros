@@ -1306,10 +1306,11 @@ local function UM_EnsureIconPicker()
   f:SetMovable(true)
   f:EnableMouse(true)
   f:RegisterForDrag("LeftButton")
-  f:SetScript("OnDragStart", function() f:StartMoving() end)  -- Changed from this to f
-  f:SetScript("OnDragStop", function() f:StopMovingOrSizing() end)  -- Changed from this to f
-  f:SetFrameStrata("DIALOG")  -- ADD THIS - ensures it's above the main frame
-  f:SetToplevel(true)  -- ADD THIS - makes it independently clickable
+  f:SetScript("OnDragStart", function() f:StartMoving() end)
+  f:SetScript("OnDragStop", function() f:StopMovingOrSizing() end)
+  f:SetFrameStrata("FULLSCREEN_DIALOG")  -- CHANGED: Higher strata
+  f:SetToplevel(true)
+  f:SetFrameLevel(10)  -- ADDED: Explicit high frame level
 
   local t = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
   t:SetPoint("TOP", 0, -10)
@@ -1367,20 +1368,14 @@ local function UM_EnsureIconPicker()
 
   f.scroll = scroll
   f.content = content
+  f.buttons = {}  -- ADDED: Track created buttons
 
-  -- ADD MOUSE WHEEL SCROLLING
+  -- Mouse wheel scrolling
   local function UM_IconPickerWheelScroll(delta)
-    if ScrollFrameTemplate_OnMouseWheel then
-      local oldThis = this
-      this = scroll
-      ScrollFrameTemplate_OnMouseWheel(delta or 0)
-      this = oldThis
-    else
-      local bar = getglobal(scroll:GetName() .. "ScrollBar")
-      if bar then
-        local step = (bar:GetValueStep() or 20) * 3
-        bar:SetValue((bar:GetValue() or 0) - (delta or 0) * step)
-      end
+    local bar = getglobal(scroll:GetName() .. "ScrollBar")
+    if bar then
+      local step = (bar:GetValueStep() or 20) * 3
+      bar:SetValue((bar:GetValue() or 0) - (delta or 0) * step)
     end
   end
 
@@ -1393,100 +1388,103 @@ local function UM_EnsureIconPicker()
   local SIZE = 32
   local PAD  = 6
 
+  function f:CreateButton(i, tex)
+    local btn = f.buttons[i]
+    if not btn then
+      btn = CreateFrame("Button", "UltimaMacrosIconCell"..i, content)
+      btn:SetWidth(SIZE); btn:SetHeight(SIZE)
+      btn.icon = btn:CreateTexture(nil, "BACKGROUND")
+      btn.icon:SetAllPoints(btn)
+      btn:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
+      btn:SetScript("OnClick", function()
+        local texPath = this._tex
+        local name = UltimaMacrosFrameNameEdit and UltimaMacrosFrameNameEdit:GetText() or ""
+        if name == "" then
+          DEFAULT_CHAT_FRAME:AddMessage("|cffff5555UltimaMacros: Enter macro name first|r")
+          return
+        end
+        local r = UM_Get(name)
+        if not r then
+          DEFAULT_CHAT_FRAME:AddMessage("|cffff5555UltimaMacros: Macro not found|r")
+          return
+        end
+        r.icon = texPath
+        if UltimaMacrosIconButton then
+          UltimaMacrosIconButton:SetNormalTexture(UM_TexturePath(texPath))
+        end
+        UM_RefreshAllSlotsForName(name)
+        UM_CloseIconPicker()
+      end)
+      f.buttons[i] = btn
+    end
+    btn._tex = tex
+    btn.icon:SetTexture(UM_TexturePath(tex))
+    return btn
+  end
+
   function f:ApplyFilter(query)
     query = string.lower(query or "")
     local total = table.getn(UM_ICON_CHOICES)
     local visible = {}
 
+    -- Build visible list
     if query == "" then
-      for i = 1, total do visible[table.getn(visible)+1] = i end
+      for i = 1, total do
+        tinsert(visible, i)
+      end
     else
       for i = 1, total do
         local tex = UM_ICON_CHOICES[i]
         local base = UM_IconBasename(tex)
         if string.find(base, query, 1, true) then
-          visible[table.getn(visible)+1] = i
+          tinsert(visible, i)
         end
       end
     end
 
+    -- Hide all buttons first
+    for i = 1, total do
+      local btn = f.buttons[i]
+      if btn then btn:Hide() end
+    end
+
+    -- Show and position visible buttons
     local n = table.getn(visible)
+    for vi = 1, n do
+      local idx = visible[vi]
+      local btn = f:CreateButton(idx, UM_ICON_CHOICES[idx])
+
+      local row = math.floor((vi-1) / COLS)
+      local col = math.mod(vi-1, COLS)
+
+      btn:ClearAllPoints()
+      btn:SetPoint("TOPLEFT", content, "TOPLEFT",
+                   PAD + col * (SIZE + PAD),
+                   -PAD - row * (SIZE + PAD))
+      btn:Show()
+    end
+
+    -- Update content height
     local rows = math.ceil(n / COLS)
-    local contentH = rows * (SIZE + PAD) + PAD
+    local contentH = math.max(300, rows * (SIZE + PAD) + PAD)
     content:SetHeight(contentH)
 
     -- Update scroll frame
-    if scroll.UpdateScrollChildRect then
-      scroll:UpdateScrollChildRect()
-    end
-
-    local shownSet = {}
-    for vi = 1, n do
-      local idx = visible[vi]
-      local btn = getglobal("UltimaMacrosIconCell"..idx)
-      if btn then
-        local row = math.floor((vi-1) / COLS)
-        local col = math.mod(vi-1, COLS)
-        btn:ClearAllPoints()
-        btn:SetPoint("TOPLEFT", content, "TOPLEFT",
-                     PAD + col * (SIZE + PAD),
-                     -PAD - row * (SIZE + PAD))
-        btn:Show()
-        shownSet[idx] = true
-      end
-    end
-
-    for i = 1, total do
-      if not shownSet[i] then
-        local btn = getglobal("UltimaMacrosIconCell"..i)
-        if btn then btn:Hide() end
-      end
-    end
+    scroll:UpdateScrollChildRect()
+    scroll:SetVerticalScroll(0)  -- Reset scroll to top
   end
 
   function f:Rebuild(nm)
-    local rec = nm and UM_Get(nm)
     UM_RebuildIconChoices()
 
-    local total = table.getn(UM_ICON_CHOICES)
-
-    for i = 1, total do
-      local btn = getglobal("UltimaMacrosIconCell"..i)
-      if not btn then
-        btn = CreateFrame("Button", "UltimaMacrosIconCell"..i, content)
-        btn:SetWidth(SIZE); btn:SetHeight(SIZE)
-        btn.icon = btn:CreateTexture(nil, "BACKGROUND")
-        btn.icon:SetAllPoints(btn)
-        btn:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square")
-        btn:SetScript("OnClick", function()
-          local tex = this._tex
-          local name = UltimaMacrosFrameNameEdit and UltimaMacrosFrameNameEdit:GetText() or ""
-          if name == "" then return end
-          local r = UM_Get(name); if not r then return end
-          r.icon = tex
-          if UltimaMacrosIconButton then
-            UltimaMacrosIconButton:SetNormalTexture(UM_TexturePath(tex))
-          end
-          UM_RefreshAllSlotsForName(name)
-          UM_CloseIconPicker()
-        end)
-      end
-      local tex = UM_ICON_CHOICES[i]
-      btn._tex = tex
-      btn.icon:SetTexture(UM_TexturePath(tex))
+    -- Reset search
+    if f.searchBox then
+      f.searchBox:SetText("")
+      f.searchHint:Show()
     end
 
-    local i2 = total + 1
-    while true do
-      local extra = getglobal("UltimaMacrosIconCell"..i2)
-      if not extra then break end
-      extra:Hide()
-      i2 = i2 + 1
-    end
-
-    local q = f.searchBox and f.searchBox:GetText() or ""
-    if q == "" then f.searchHint:Show() else f.searchHint:Hide() end
-    f:ApplyFilter(q or "")
+    -- Apply filter to show all icons
+    f:ApplyFilter("")
   end
 
   tinsert(UISpecialFrames, "UltimaMacrosIconPicker")
@@ -1499,10 +1497,11 @@ local function UM_OpenIconPicker(anchorFrame)
   local f = UM_EnsureIconPicker()
   f:ClearAllPoints()
   if anchorFrame then
-    f:SetPoint("TOPLEFT", anchorFrame, "BOTTOMLEFT", -8, -8)
+    f:SetPoint("TOP", anchorFrame, "BOTTOM", 0, -8)
   else
     f:SetPoint("CENTER")
   end
+  f:Raise()  -- ADDED: Bring to front
   f:Show()
   local nm = (UltimaMacrosFrameNameEdit and UltimaMacrosFrameNameEdit:GetText()) or ""
   f:Rebuild(nm)
