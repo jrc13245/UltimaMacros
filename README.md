@@ -52,8 +52,8 @@ WTF\Account<ACCOUNT>\SavedVariables\UltimaMacros.lua
 ### Opening the Editor
 Use either command:
 
-/umacro
-/umacros
+/umacro frame
+/umacros frame
 
 This toggles the UltimaMacros editor frame.
 
@@ -102,6 +102,8 @@ Executes a saved macro directly by name.
 
 ## 🧩 Known Limitations
 
+- Macros made with UltimaMacros cannot be saved the normal way that some actionbar addons are capable of.
+- UMacros can be overwritten in their slot by placing a Blizzard action onto the same slot. Umacros cannot be placed where a Blizzard action already exists.
 - Macros made here do **not** appear in the default Blizzard macro UI.
 - Action buttons use the chosen icon or Blizzard’s standard fallback if the macro can’t resolve an automatic texture.
 - Only the UltimaMacros editor can create and edit these macros.
@@ -111,8 +113,12 @@ Executes a saved macro directly by name.
 
 ## 📜 Changelog
 
+### v1.0.2
+- First release with:
+  - Actionbar slot protections to prevent multiple actions on the same slot
+
 ### v1.0.1
-- First release with
+- First release with:
   - Icon Grid Picker
 
 ### v1.0.0
