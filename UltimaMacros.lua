@@ -707,6 +707,20 @@ local function UM_EnsureProxyMacro()
   return idx
 end
 
+local function UM_CheckForSlotConflicts()
+  for slot in pairs(UM_MappedSlots) do
+    -- Check if a real action has been placed in our mapped slot
+    if UM_SlotHasRealAction(slot) then
+      local name = UM_GetMappedName(slot)
+      UM_ClearAction(slot)
+      if name then
+        DEFAULT_CHAT_FRAME:AddMessage("|cffffcc00UltimaMacros: Removed '"..name.."' from slot "..slot.." (conflict detected)|r")
+      end
+      UM_RefreshActionButtonsForSlot(slot)
+    end
+  end
+end
+
 -- ----- Hooks: map your macro to action bar, render icon/name, run on press -----
 local function UM_InstallHooks()
   if UM_HooksInstalled then return end
@@ -742,6 +756,14 @@ local function UM_InstallHooks()
       UM_SetAction(slot, macroName)
       UM_RefreshActionButtonsForSlot(slot)
       return
+    else
+      -- Not placing an UltimaMacro, check if this will conflict with existing UM mapping
+      local existingUM = UM_GetMappedName(slot)
+      if existingUM then
+        -- A Blizzard action is being placed where we have a mapping - remove our mapping
+        UM_ClearAction(slot)
+        DEFAULT_CHAT_FRAME:AddMessage("|cffffcc00UltimaMacros: Removed '"..existingUM.."' from slot "..slot.." (replaced by action)|r")
+      end
     end
     return UM_oldPlaceAction(slot)
   end
@@ -749,6 +771,12 @@ local function UM_InstallHooks()
   UseAction = function(slot, checkCursor, onSelf)
     local name = UM_GetMappedName(slot)
     if name then
+      -- Double-check no real action has taken this slot
+      if UM_SlotHasRealAction(slot) then
+        UM_ClearAction(slot)
+        DEFAULT_CHAT_FRAME:AddMessage("|cffffcc00UltimaMacros: '"..name.."' mapping removed (slot conflict)|r")
+        return UM_oldUseAction(slot, checkCursor, onSelf)
+      end
       UM_Run(name)
       return
     end
@@ -1822,6 +1850,7 @@ UM_EventFrame:RegisterEvent("VARIABLES_LOADED")
 UM_EventFrame:RegisterEvent("PLAYER_LOGIN")
 UM_EventFrame:RegisterEvent("ADDON_LOADED")          -- recheck when SCM/SuperMacro load later
 UM_EventFrame:RegisterEvent("PLAYER_ENTERING_WORLD") -- one-shot delayed recheck
+UM_EventFrame:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
 
 UM_EventFrame:SetScript("OnEvent", function()
   if event == "VARIABLES_LOADED" or event == "PLAYER_LOGIN" then
@@ -1839,6 +1868,9 @@ UM_EventFrame:SetScript("OnEvent", function()
     if UM_RebuildIconChoices then UM_RebuildIconChoices() end
     if UM_UI_FixButtonLabels then UM_UI_FixButtonLabels() end
 
+    -- Check for conflicts on login
+    UM_CheckForSlotConflicts()
+
   elseif event == "ADDON_LOADED" then
     -- Vanilla-style global arg1 contains the addon name
     local addon = arg1
@@ -1853,7 +1885,22 @@ UM_EventFrame:SetScript("OnEvent", function()
     if not UM_SCM_compat_enabled and UM_IsSCMLoaded() then
       UM_EnableSCMCompat()
     end
+
+    -- Check for conflicts after entering world
+    UM_CheckForSlotConflicts()
+
     UM_EventFrame:UnregisterEvent("PLAYER_ENTERING_WORLD")
+
+  elseif event == "ACTIONBAR_SLOT_CHANGED" then
+    -- Check the specific slot that changed
+    local slot = arg1
+    if slot and UM_GetMappedName(slot) then
+      if UM_SlotHasRealAction(slot) then
+        local name = UM_GetMappedName(slot)
+        UM_ClearAction(slot)
+        DEFAULT_CHAT_FRAME:AddMessage("|cffffcc00UltimaMacros: Removed '"..name.."' from slot "..slot.." (action placed)|r")
+      end
+    end
   end
 end)
 
