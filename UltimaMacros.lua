@@ -22,6 +22,7 @@ local strlower = string.lower
 
 -- UI scope state (editor checkbox): "char" or "account"
 local UM_UI_Scope = "char"
+local UM_UI_OriginalName = nil  -- Tracks the name of the macro currently loaded in editor
 local UM_LocalUI = {}
 local UM_hasUnsavedChanges = false
 local UM_PendingDelete = nil
@@ -1465,6 +1466,7 @@ function UM_UI_LoadIntoEditor(name)
   local m, scope = UM_Get(name)
   if not m then return end
 
+  UM_UI_OriginalName = name  -- Track original name for rename handling
   UltimaMacrosFrameNameEdit:SetText(m.name or "")
   UltimaMacrosFrameEditBox:SetText(m.text or "")
   UM_UI_Scope = scope or "char"
@@ -1517,6 +1519,7 @@ end
 function UM_UI_ClearEditor()
   UltimaMacrosFrameNameEdit:SetText("")
   UltimaMacrosFrameEditBox:SetText("")
+  UM_UI_OriginalName = nil  -- Clear original name tracking
   UM_UI_Scope = "char"
   if UltimaMacrosScopeCheck then
     UltimaMacrosScopeCheck:SetChecked(true)
@@ -1536,7 +1539,55 @@ function UM_UI_Save()
     text = string.sub(text, 1, 7000)
     UltimaMacrosFrameEditBox:SetText(text)
   end
-  UM_Save(name, text, UM_UI_Scope)
+
+  -- Handle rename: if original name exists and differs from current name
+  if UM_UI_OriginalName and UM_UI_OriginalName ~= "" and UM_UI_OriginalName ~= name then
+    local oldName = UM_UI_OriginalName
+    local rec, scope = UM_Get(oldName)
+    if rec then
+      -- Check if the new name already exists (would be a conflict)
+      local existingIdx = UM_FindIndexByName(name)
+      if existingIdx then
+        DEFAULT_CHAT_FRAME:AddMessage("|cffff5555UltimaMacros: A macro named '"..name.."' already exists.|r")
+        return
+      end
+
+      -- Unregister old name from SCRM before renaming
+      if UM_SCM_compat_enabled then
+        UM_UnregisterMacroFromSCRM(oldName)
+      end
+
+      -- Update the macro's name field
+      rec.name = name
+      rec.text = text
+
+      -- Update all action bar slots that reference the old name
+      local actionMap = UM_GetActionMap()
+      for slot, mappedName in pairs(actionMap) do
+        if mappedName == oldName then
+          actionMap[slot] = name
+        end
+      end
+
+      -- Re-register with SCRM under new name
+      if UM_SCM_compat_enabled then
+        UM_RegisterMacroWithSCRM(name)
+      end
+
+      -- Refresh all slots that now use the new name
+      UM_RefreshAllSlotsForName(name)
+    else
+      -- Original no longer exists, just save as new
+      UM_Save(name, text, UM_UI_Scope)
+    end
+  else
+    -- Normal save (no rename)
+    UM_Save(name, text, UM_UI_Scope)
+  end
+
+  -- Update original name to current name after successful save
+  UM_UI_OriginalName = name
+
   UM_UI_RefreshList()
 
   -- Clear unsaved changes flag
@@ -1997,16 +2048,22 @@ local function UM_EnsureIconPicker()
           DEFAULT_CHAT_FRAME:AddMessage("|cffff5555UltimaMacros: Enter macro name first|r")
           return
         end
+        -- Try current name first, fall back to original name (handles unsaved renames)
         local r = UM_Get(name)
+        local actualName = name
+        if not r and UM_UI_OriginalName and UM_UI_OriginalName ~= "" then
+          r = UM_Get(UM_UI_OriginalName)
+          actualName = UM_UI_OriginalName
+        end
         if not r then
-          DEFAULT_CHAT_FRAME:AddMessage("|cffff5555UltimaMacros: Macro not found|r")
+          DEFAULT_CHAT_FRAME:AddMessage("|cffff5555UltimaMacros: Macro not found. Save the macro first.|r")
           return
         end
         r.icon = texPath
         if UltimaMacrosIconButton then
           UltimaMacrosIconButton:SetNormalTexture(UM_TexturePath(texPath))
         end
-        UM_RefreshAllSlotsForName(name)
+        UM_RefreshAllSlotsForName(actualName)
         UM_CloseIconPicker()
       end)
       f.buttons[i] = btn
