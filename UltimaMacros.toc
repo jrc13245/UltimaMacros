@@ -2,7 +2,7 @@
 ## Title: UltimaMacros
 ## Notes: Extra macro storage
 ## Author: torio
-## Version: 1.0.2
+## Version: 1.1.0
 ## SavedVariables: UltimaMacrosDB
 ## OptionalDeps: SuperCleveroidMacros, SuperMacro
 

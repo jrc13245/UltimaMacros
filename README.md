@@ -1,7 +1,7 @@
 # UltimaMacros
 
 A lightweight, self-contained macro system for **World of Warcraft 1.12.1**.  
-Provides its own macro storage (up to **2056 characters** per macro) and an in-game editor with per-character or account-wide scope.
+Provides its own macro storage (up to **7000 characters** per macro) and an in-game editor with per-character or account-wide scope.
 
 UltimaMacros:
 
@@ -16,7 +16,7 @@ UltimaMacros:
 ## ✨ Features
 
 - **Separate macro storage** (doesn’t count against Blizzard’s macro limits).
-- **Longer macros**: up to 2056 characters.
+- **Longer macros**: up to 7000 characters.
 - **Per-character or account-wide** macros (toggle in the UI).
 - **Drag & drop action mapping** — place any UltimaMacro onto your action bars.
 - **Dynamic icon & tooltip updates** when you edit or save a macro (no UI reload needed).
@@ -50,23 +50,25 @@ WTF\Account<ACCOUNT>\SavedVariables\UltimaMacros.lua
 ## 🚀 Usage
 
 ### Opening the Editor
-Use either command:
+Use any of these methods:
 
-/umacro frame
-/umacros frame
+/umacro
+/umacros
 
-This toggles the UltimaMacros editor frame.
+Or click the **UltimaMacros** button on Blizzard's default macro frame.
 
 ### Creating Macros
-1. Click **New (C)** to create a per-character macro, or **New (A)** for an account-wide macro.
-2. Enter a **name** in the top box.
-3. Write your macro body in the large bottom editor box.
-4. Click the macro icon on the right of the Delete button to go through a selection of icons.
+1. Click **New** to create a new macro.
+2. Toggle the **Char/Acct** checkbox to set per-character or account-wide scope.
+3. Enter a **name** in the top box.
+4. Write your macro body in the large bottom editor box.
+5. Click the macro icon to select from available icons.
 
 > The editor supports any standard Blizzard macro commands and commands from any installed addons.
 
 ### Placing on Action Bars
-- Drag a macro from the **left-hand list** (or use the small icon button) onto any action bar slot.
+- Drag a macro from the **left-hand list** onto any action bar slot.
+- **Swap**: Dragging a macro onto a slot with another UltimaMacro will swap them (the old one goes on your cursor).
 
 ### Editing Macros
 - Click a macro name in the list to load it into the editor.
@@ -96,7 +98,7 @@ Executes a saved macro directly by name.
 - **Tab / Enter** in the name field → jump to the body field.
 - **Tab** in the body field → jump back to the name field.
 - **Esc** clears focus; press **Esc again** to close the window.
-- Character counter shows `used/2056` characters.
+- Character counter shows `used/7000` characters.
 
 ---
 

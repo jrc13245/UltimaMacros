@@ -1,5 +1,6 @@
--- UltimaMacros - Vanilla 1.12.1 (Lua 5.0)
--- Separate macro list stored in SavedVariables with 2056-char per macro cap.
+-- UltimaMacros v1.1 - Vanilla 1.12.1 (Lua 5.0)
+-- Separate macro list stored in SavedVariables with 7000-char per macro cap.
+-- Supports SuperCleveRoidMacros and pfUI integration.
 -- Supports per-macro scope: per-character or per-account.
 -- SuperMacro-style action mapping: NO reliance on Blizzard macro storage for macro content.
 -- We briefly use a proxy macro only to put a valid payload on the cursor during drag.
@@ -24,6 +25,11 @@ local UM_UI_Scope = "char"
 local UM_LocalUI = {}
 local UM_hasUnsavedChanges = false
 local UM_PendingDelete = nil
+
+-- Forward declarations for SCRM compatibility (defined later)
+local UM_SCM_compat_enabled = false
+local UM_RegisterMacroWithSCRM
+local UM_UnregisterMacroFromSCRM
 
 local function UM_GetCharKey()
   local name = UnitName("player")
@@ -63,6 +69,125 @@ local function UM_TexturePath(icon)
     return icon
   end
   return "Interface\\Icons\\" .. icon
+end
+
+-- Find spell texture by name
+local function UM_GetSpellTexture(spellName)
+  if not spellName or spellName == "" then return nil end
+  -- Strip rank info like "(Rank 1)"
+  spellName = string.gsub(spellName, "%s*%([^)]*%)%s*$", "")
+  spellName = string.gsub(spellName, "^%s+", "")
+  spellName = string.gsub(spellName, "%s+$", "")
+  if spellName == "" then return nil end
+
+  -- Search spellbook
+  local i = 1
+  while true do
+    local name, rank = GetSpellName(i, BOOKTYPE_SPELL)
+    if not name then break end
+    if string.lower(name) == string.lower(spellName) then
+      return GetSpellTexture(i, BOOKTYPE_SPELL)
+    end
+    i = i + 1
+  end
+
+  -- Search pet spellbook
+  i = 1
+  while true do
+    local name = GetSpellName(i, BOOKTYPE_PET)
+    if not name then break end
+    if string.lower(name) == string.lower(spellName) then
+      return GetSpellTexture(i, BOOKTYPE_PET)
+    end
+    i = i + 1
+  end
+
+  return nil
+end
+
+-- Find item texture by name
+local function UM_GetItemTexture(itemName)
+  if not itemName or itemName == "" then return nil end
+  itemName = string.gsub(itemName, "^%s+", "")
+  itemName = string.gsub(itemName, "%s+$", "")
+  if itemName == "" then return nil end
+
+  local lowerName = string.lower(itemName)
+
+  -- Check inventory slots
+  for slot = 1, 19 do
+    local link = GetInventoryItemLink("player", slot)
+    if link then
+      local _, _, name = string.find(link, "%[(.-)%]")
+      if name and string.lower(name) == lowerName then
+        return GetInventoryItemTexture("player", slot)
+      end
+    end
+  end
+
+  -- Check bags
+  for bag = 0, 4 do
+    local numSlots = GetContainerNumSlots(bag)
+    for slot = 1, numSlots do
+      local link = GetContainerItemLink(bag, slot)
+      if link then
+        local _, _, name = string.find(link, "%[(.-)%]")
+        if name and string.lower(name) == lowerName then
+          local tex = GetContainerItemInfo(bag, slot)
+          return tex
+        end
+      end
+    end
+  end
+
+  return nil
+end
+
+-- Parse #showtooltip and /cast lines to get dynamic icon
+local function UM_GetDynamicIcon(macroBody)
+  if not macroBody or macroBody == "" then return nil end
+
+  -- Look for #showtooltip line
+  local _, _, showtooltipArg = string.find(macroBody, "#showtooltip%s*([^\n]*)")
+  if showtooltipArg then
+    showtooltipArg = string.gsub(showtooltipArg, "^%s+", "")
+    showtooltipArg = string.gsub(showtooltipArg, "%s+$", "")
+
+    -- If #showtooltip has a specific spell/item name
+    if showtooltipArg ~= "" then
+      -- Strip conditionals like [mod:shift]
+      local name = string.gsub(showtooltipArg, "%[.-%]%s*", "")
+      name = string.gsub(name, "^%s+", "")
+      if name ~= "" then
+        local tex = UM_GetSpellTexture(name) or UM_GetItemTexture(name)
+        if tex then return tex end
+      end
+    end
+  end
+
+  -- If #showtooltip is empty or not found, look at first /cast or /use line
+  for line in string.gfind(macroBody, "[^\n]+") do
+    local _, _, cmd, rest = string.find(line, "^%s*/(%w+)%s*(.*)")
+    if cmd then
+      local lowerCmd = string.lower(cmd)
+      if lowerCmd == "cast" or lowerCmd == "use" then
+        -- Strip conditionals
+        local name = string.gsub(rest or "", "%[.-%]%s*", "")
+        -- Handle multiple options separated by ;
+        local _, _, firstName = string.find(name, "^%s*([^;]+)")
+        if firstName then
+          firstName = string.gsub(firstName, "^%s+", "")
+          firstName = string.gsub(firstName, "%s+$", "")
+          if firstName ~= "" then
+            local tex = UM_GetSpellTexture(firstName) or UM_GetItemTexture(firstName)
+            if tex then return tex end
+          end
+        end
+      end
+    end
+  end
+
+  return nil
 end
 
 -- ***********************
@@ -119,6 +244,12 @@ end
 local function UM_RefreshAllSlotsForName(name)
   if not name or name == "" then return end
 
+  -- Register/update this macro with SCRM's Macros table
+  if UM_SCM_compat_enabled then
+    UM_RegisterMacroWithSCRM(name)
+  end
+
+  -- Notify SuperCleveRoidMacros to re-index macros
   if CleveRoids and CleveRoids.Frame and CleveRoids.Frame.UPDATE_MACROS then
     pcall(CleveRoids.Frame.UPDATE_MACROS, CleveRoids.Frame)
     if CleveRoids.QueueActionUpdate then pcall(CleveRoids.QueueActionUpdate) end
@@ -126,9 +257,36 @@ local function UM_RefreshAllSlotsForName(name)
 
   for slot in pairs(UM_MappedSlots) do
     if UM_GetMappedName(slot) == name then
-      if CleveRoids and CleveRoids.Frame and CleveRoids.Frame.ACTIONBAR_SLOT_CHANGED then
-        pcall(CleveRoids.Frame.ACTIONBAR_SLOT_CHANGED, CleveRoids.Frame, slot)
+      -- Notify SCRM about the slot change
+      if CleveRoids then
+        -- Clear cached action so SCRM re-parses it
+        if CleveRoids.ClearAction then
+          pcall(CleveRoids.ClearAction, slot)
+        end
+        -- Re-index this slot so it's back in CleveRoids.Actions
+        if CleveRoids.GetAction and CleveRoids.ready then
+          pcall(CleveRoids.GetAction, slot)
+        end
+        -- Trigger SCRM's slot changed handler
+        if CleveRoids.Frame and CleveRoids.Frame.ACTIONBAR_SLOT_CHANGED then
+          pcall(CleveRoids.Frame.ACTIONBAR_SLOT_CHANGED, CleveRoids.Frame, slot)
+        end
+        -- Send action event to registered handlers (pfUI, Bongos, etc.)
+        if CleveRoids.SendEventForAction then
+          pcall(CleveRoids.SendEventForAction, slot, "ACTIONBAR_SLOT_CHANGED", slot)
+        end
       end
+
+      -- Direct pfUI notification (if SCRM isn't handling it)
+      if pfUI and pfUI.bars then
+        if pfUI.bars.update then
+          pfUI.bars.update[slot] = true
+        end
+        if pfUI.bars.buttons and pfUI.bars.buttons[slot] and pfUI.bars.ButtonFullUpdate then
+          pcall(pfUI.bars.ButtonFullUpdate, pfUI.bars.buttons[slot])
+        end
+      end
+
       UM_RefreshActionButtonsForSlot(slot)
     end
   end
@@ -165,6 +323,12 @@ local function UM_Delete(name)
     DEFAULT_CHAT_FRAME:AddMessage("|cffff5555UltimaMacros: not found.|r")
     return
   end
+
+  -- Unregister from SCRM before deleting
+  if UM_SCM_compat_enabled then
+    UM_UnregisterMacroFromSCRM(name)
+  end
+
   if scope == "char" then
     local ck = UM_GetCharKey()
     tremove(UltimaMacrosDB.chars[ck].macros, idx)
@@ -175,7 +339,8 @@ local function UM_Delete(name)
   UM_UI_ClearEditor()
   UM_UI_RefreshList()
 
-  -- NEW: clear any buttons mapped to this name (icon/tooltip won’t be stale)
+  -- Clear any buttons mapped to this name (icon/tooltip won't be stale)
+  -- Note: UM_RefreshAllSlotsForName won't re-register since macro is deleted
   UM_RefreshAllSlotsForName(name)
 end
 
@@ -186,8 +351,8 @@ local function UM_Save(name, text, scope)
     return
   end
   if not text then text = "" end
-  if string.len(text) > 2056 then
-    text = string.sub(text, 1, 2056)
+  if string.len(text) > 7000 then
+    text = string.sub(text, 1, 7000)
   end
 
   UM_EnsureTables()
@@ -268,7 +433,7 @@ local function UM_SendSlash(line)
   ChatEdit_SendText(eb)
 end
 
-local function UM_RunLine(line)
+function UM_RunLine(line)
   line = UM_Trim(line or "")
   if line == "" then return end
 
@@ -315,7 +480,7 @@ local function UM_ForEachLine(text, fn)
   end
 end
 
-local function UM_Run(name)
+function UM_Run(name)
   local m = UM_Get(name)
   if not m then
     DEFAULT_CHAT_FRAME:AddMessage("|cffff5555UltimaMacros: '"..(name or "?").."' not found.|r")
@@ -329,6 +494,7 @@ end
 -- ============================================================
 local UM_CURSOR = nil
 local UM_HooksInstalled = false
+local UM_InHook = {}  -- Re-entrancy guards for hooks
 
 local function UM_GetActionMap()
   UM_EnsureTables()
@@ -381,13 +547,26 @@ UM_RefreshActionButtonsForSlot = function(slot)
       if icon then icon:SetTexture(iconTex) end
 
       local label = getglobal(btnName.."Name")
-      if label then label:SetText(name or "") end
+      if label then
+        if name then
+          label:SetText(name)
+          label:Show()
+        else
+          label:SetText("")
+        end
+      end
 
       if ActionButton_Update then
         local oldThis = this
         this = btn
         pcall(ActionButton_Update)
         this = oldThis
+      end
+
+      -- Re-apply name after ActionButton_Update (it may have hidden it)
+      if name and label then
+        label:SetText(name)
+        label:Show()
       end
     end
   end
@@ -571,13 +750,13 @@ end
 -- so #showtooltip and SCM’s parser work.
 -- ============================================================
 
--- Two “virtual id” spaces:
+-- Two "virtual id" spaces:
 --  - SLOT space: map action slot -> virtual macro id (kept for completeness)
 --  - NAME space: map macro name -> virtual macro id (required for SCM)
 local UM_SCM_SLOT_BASE = 50000
 local UM_SCM_NAME_BASE = 60000
 
-local UM_SCM_compat_enabled = false
+-- UM_SCM_compat_enabled is forward-declared at top of file
 local UM_oldGetActionInfo, UM_oldGetMacroInfo, UM_oldGetMacroIndexByName
 
 -- name<->index tables for virtual NAME space
@@ -611,8 +790,8 @@ end
 -- Detect SCM/SuperMacro presence (broad but safe)
 local function UM_IsSCMLoaded()
   if type(IsAddOnLoaded) == "function" then
-    if IsAddOnLoaded("SuperCleveroidMacros") or IsAddOnLoaded("SuperCleveroid")
-       or IsAddOnLoaded("SuperMacro") then
+    if IsAddOnLoaded("SuperCleveRoidMacros") or IsAddOnLoaded("SuperCleveroidMacros")
+       or IsAddOnLoaded("SuperCleveroid") or IsAddOnLoaded("SuperMacro") then
       return true
     end
   end
@@ -623,9 +802,71 @@ local function UM_IsSCMLoaded()
   return false
 end
 
+-- Detect pfUI presence
+local function UM_IsPfUILoaded()
+  return _G.pfUI and _G.pfUI.bars
+end
+
+-- Register a single UM macro with CleveRoids.Macros table for SCRM parsing
+-- (Assigns to forward-declared local)
+UM_RegisterMacroWithSCRM = function(name)
+  if not CleveRoids then return end
+  local rec = UM_Get(name)
+  if not rec then return end
+
+  -- Use SCRM's ParseMacro to build the full actions structure with conditionals
+  -- This requires our GetMacroInfo hook to be installed first
+  if CleveRoids.ParseMacro then
+    -- Clear any existing entry so ParseMacro will re-parse
+    if CleveRoids.Macros and CleveRoids.Macros[name] then
+      CleveRoids.Macros[name] = nil
+    end
+
+    -- Call SCRM's parser - it uses our hooked GetMacroInfo to get the body
+    local parsed = CleveRoids.ParseMacro(name)
+    if parsed then
+      -- Mark as UltimaMacros-managed so we can identify it
+      parsed._ultimaMacro = true
+      return
+    end
+  end
+
+  -- Fallback: basic registration (no conditional support)
+  if CleveRoids.Macros then
+    CleveRoids.Macros[name] = {
+      name = name,
+      body = rec.text or "",
+      icon = UM_TexturePath(rec.icon),
+      actions = { list = {} },  -- Empty actions structure for safety
+      _ultimaMacro = true,
+    }
+  end
+end
+
+-- Register all UM macros with SCRM
+local function UM_RegisterAllMacrosWithSCRM()
+  if not CleveRoids or not CleveRoids.Macros then return end
+  local list = UM_List()
+  for i = 1, table.getn(list) do
+    UM_RegisterMacroWithSCRM(list[i].name)
+  end
+end
+
+-- Unregister a UM macro from SCRM (when deleted)
+-- (Assigns to forward-declared local)
+UM_UnregisterMacroFromSCRM = function(name)
+  if not CleveRoids or not CleveRoids.Macros then return end
+  if CleveRoids.Macros[name] and CleveRoids.Macros[name]._ultimaMacro then
+    CleveRoids.Macros[name] = nil
+  end
+end
+
 local function UM_EnableSCMCompat()
   if UM_SCM_compat_enabled then return end
   UM_SCM_compat_enabled = true
+
+  -- IMPORTANT: Install hooks FIRST before registering macros
+  -- Otherwise ParseMacro won't find our macros through GetMacroInfo
 
   if not UM_oldGetMacroInfo then
     UM_oldGetMacroInfo = GetMacroInfo
@@ -681,6 +922,40 @@ local function UM_EnableSCMCompat()
     local name, tex, body = UM_oldGetMacroInfo(index)
     if not name then return nil end
     return name, tex, body
+  end
+
+  -- NOW register all existing UM macros with SCRM (after hooks are installed)
+  UM_RegisterAllMacrosWithSCRM()
+
+  -- Trigger SCRM to index our mapped slots (adds them to CleveRoids.Actions)
+  -- This ensures TestForAllActiveActions includes our slots for icon updates
+  if CleveRoids.GetAction and CleveRoids.ready then
+    for slot in pairs(UM_MappedSlots) do
+      pcall(CleveRoids.GetAction, slot)
+    end
+  end
+
+  -- Hook SCRM's UPDATE_MACROS to re-register our macros after it clears CleveRoids.Macros
+  if CleveRoids and CleveRoids.Frame and CleveRoids.Frame.UPDATE_MACROS then
+    local UM_oldSCRM_UPDATE_MACROS = CleveRoids.Frame.UPDATE_MACROS
+    CleveRoids.Frame.UPDATE_MACROS = function(self)
+      -- Call original SCRM handler first
+      if UM_oldSCRM_UPDATE_MACROS then
+        UM_oldSCRM_UPDATE_MACROS(self)
+      end
+      -- Re-register our macros after SCRM clears its table
+      UM_RegisterAllMacrosWithSCRM()
+    end
+  end
+
+  -- Register with SCRM's action event handler system for pfUI/Bongos updates
+  if CleveRoids.RegisterActionEventHandler then
+    CleveRoids.RegisterActionEventHandler(function(slot, event)
+      -- When SCRM sends action events, also update our button display
+      if UM_GetMappedName(slot) then
+        UM_RefreshActionButtonsForSlot(slot)
+      end
+    end)
   end
 end
 
@@ -744,17 +1019,39 @@ local function UM_InstallHooks()
   PlaceAction = function(slot)
     if UM_CURSOR then
       local macroName = UM_CURSOR
-      UM_CURSOR = nil
-      ClearCursor()
 
-      -- Check if there's a REAL action here
+      -- Check if there's a REAL action here (Blizzard spell/item/macro)
       if UM_SlotHasRealAction(slot) then
-        DEFAULT_CHAT_FRAME:AddMessage("|cffff5555UltimaMacros: Slot " .. slot .. " is occupied!|r")
+        -- Pick up the Blizzard action first (swap it out)
+        UM_CURSOR = nil  -- Clear our cursor state temporarily
+        UM_oldPickupAction(slot)  -- This puts the Blizzard action on the cursor
+        -- Now place our UltimaMacro in the now-empty slot
+        UM_SetAction(slot, macroName)
+        UM_RefreshActionButtonsForSlot(slot)
+        -- The Blizzard action is now on the cursor for the user to place elsewhere
         return
       end
 
+      -- Check if there's an existing UltimaMacro in this slot (for swap)
+      local existingUM = UM_GetMappedName(slot)
+
+      -- Place the new macro
       UM_SetAction(slot, macroName)
       UM_RefreshActionButtonsForSlot(slot)
+
+      -- If there was an existing UltimaMacro, put it on the cursor (swap)
+      if existingUM and existingUM ~= macroName then
+        UM_CURSOR = existingUM
+        -- Put something on the cursor to show we're holding a macro
+        if UM_PickupUsingMacroProxy and UM_PickupUsingMacroProxy() then
+          -- Proxy worked
+        else
+          UM_PickupProxyForDrag_Fallback()
+        end
+      else
+        UM_CURSOR = nil
+        ClearCursor()
+      end
       return
     else
       -- Not placing an UltimaMacro, check if this will conflict with existing UM mapping
@@ -799,16 +1096,78 @@ local function UM_InstallHooks()
   end
 
   GetActionText = function(slot)
+    -- Re-entrancy guard
+    if UM_InHook["GetActionText"] then
+      return UM_oldGetActionText(slot)
+    end
+    UM_InHook["GetActionText"] = true
     local name = UM_GetMappedName(slot)
+    UM_InHook["GetActionText"] = nil
     if name then return name end
     return UM_oldGetActionText(slot)
   end
 
   GetActionTexture = function(slot)
+    -- Re-entrancy guard
+    if UM_InHook["GetActionTexture"] then
+      return UM_oldGetActionTex and UM_oldGetActionTex(slot) or nil
+    end
+    UM_InHook["GetActionTexture"] = true
     local name = UM_GetMappedName(slot)
+    UM_InHook["GetActionTexture"] = nil
     if name then
-      local tex = UM_oldGetActionTex and UM_oldGetActionTex(slot)
-      if tex then return tex end
+      -- Try SCRM's conditional evaluation for full #showtooltip support
+      if CleveRoids and CleveRoids.Macros and CleveRoids.TestForActiveAction then
+        local macro = CleveRoids.Macros[name]
+        if macro and macro.actions then
+          -- Evaluate conditionals to determine active action
+          CleveRoids.TestForActiveAction(macro.actions)
+
+          -- If we have an active action from conditional evaluation, get its icon
+          if macro.actions.active and macro.actions.active.action then
+            local actionName = macro.actions.active.action
+            -- Check if it's a castsequence with a current step
+            if macro.actions.active.sequence and CleveRoids.GetCurrentSequenceAction then
+              local seqAction = CleveRoids.GetCurrentSequenceAction(macro.actions.active.sequence)
+              if seqAction and seqAction.action then
+                actionName = seqAction.action
+              end
+            end
+            -- Look up the spell/item texture
+            local tex = macro.actions.active.texture
+                        or UM_GetSpellTexture(actionName)
+                        or UM_GetItemTexture(actionName)
+            if tex then return tex end
+          end
+
+          -- When no conditionals pass and no explicit #showtooltip, use macro's stored icon
+          -- (matches SCRM's behavior - don't show first action's icon when it didn't pass)
+          if not macro.actions.active and not macro.actions.explicitTooltip then
+            if macro.actions.list and table.getn(macro.actions.list) > 0 then
+              -- No active action, no explicit tooltip - use macro's stored icon
+              return UM_GetIconFor(name)
+            end
+          end
+
+          -- Try tooltip action for explicit #showtooltip (e.g., "#showtooltip Fireball")
+          if macro.actions.explicitTooltip and macro.actions.tooltip and macro.actions.tooltip.action then
+            local tex = macro.actions.tooltip.texture
+                        or UM_GetSpellTexture(macro.actions.tooltip.action)
+                        or UM_GetItemTexture(macro.actions.tooltip.action)
+            if tex then return tex end
+          end
+        end
+      end
+
+      -- Fallback: Try simple dynamic icon parsing (no conditional evaluation)
+      local rec = UM_Get(name)
+      if rec and rec.text then
+        local dynamicTex = UM_GetDynamicIcon(rec.text)
+        if dynamicTex then
+          return dynamicTex
+        end
+      end
+      -- Fall back to stored icon
       return UM_GetIconFor(name)
     end
     return UM_oldGetActionTex and UM_oldGetActionTex(slot) or nil
@@ -816,12 +1175,19 @@ local function UM_InstallHooks()
 
   -- Check real actions FIRST before claiming slots
   GetActionInfo = function(slot)
+    -- Re-entrancy guard
+    if UM_InHook["GetActionInfo"] then
+      return UM_oldGetActionInfo(slot)
+    end
+    UM_InHook["GetActionInfo"] = true
     local realType, realID = UM_oldGetActionInfo(slot)
     if realType and realType ~= "" then
+      UM_InHook["GetActionInfo"] = nil
       return realType, realID, nil
     end
 
     local name = UM_GetMappedName and UM_GetMappedName(slot)
+    UM_InHook["GetActionInfo"] = nil
     if name then
       return "macro", (UM_SCM_SLOT_BASE + slot), nil
     end
@@ -829,7 +1195,13 @@ local function UM_InstallHooks()
   end
 
   HasAction = function(slot)
+    -- Re-entrancy guard
+    if UM_InHook["HasAction"] then
+      return UM_oldHasAction(slot)
+    end
+    UM_InHook["HasAction"] = true
     local name = UM_GetMappedName(slot)
+    UM_InHook["HasAction"] = nil
     if name then return 1 end
     return UM_oldHasAction(slot)
   end
@@ -870,9 +1242,14 @@ SLASH_ULTIMAMACROS1 = "/umacro"
 SLASH_ULTIMAMACROS2 = "/umacros"
 SlashCmdList["ULTIMAMACROS"] = function(msg)
   local cmd = UM_Trim(msg or "")
-  if cmd == "" or cmd == "help" then
+  -- No arguments = open the frame directly
+  if cmd == "" then
+    UM_ToggleFrame()
+    return
+  end
+  if cmd == "help" then
     DEFAULT_CHAT_FRAME:AddMessage("|cff88ccffUltimaMacros usage:|r")
-    DEFAULT_CHAT_FRAME:AddMessage("/umacro frame  - open/close the editor")
+    DEFAULT_CHAT_FRAME:AddMessage("/umacro           - open/close the editor")
     DEFAULT_CHAT_FRAME:AddMessage("/umacro new <name>       - new per-character macro")
     DEFAULT_CHAT_FRAME:AddMessage("/umacro newa <name>      - new per-account macro")
     DEFAULT_CHAT_FRAME:AddMessage("/umacro del <name>")
@@ -907,7 +1284,7 @@ SlashCmdList["ULTIMAMACROS"] = function(msg)
     DEFAULT_CHAT_FRAME:AddMessage("|cff88ccffUltimaMacros: "..table.getn(list).." macros (char+account)|r")
     for i=1, table.getn(list) do
       local tag = (list[i]._scope == "account") and "[A]" or "[C]"
-      DEFAULT_CHAT_FRAME:AddMessage(" - "..tag.." "..list[i].name.." ("..string.len(list[i].text or "").."/2056)")
+      DEFAULT_CHAT_FRAME:AddMessage(" - "..tag.." "..list[i].name.." ("..string.len(list[i].text or "").."/7000)")
     end
   else
     DEFAULT_CHAT_FRAME:AddMessage("|cffff5555Unknown subcommand. Try /umacro help|r")
@@ -944,47 +1321,118 @@ function UM_UI_RefreshList()
     idx = idx + 1
   end
 
-  local offsetY = -4
+  local offsetY = -2
+  local btnWidth = UltimaMacrosListContent:GetWidth() - 8
   for i = 1, table.getn(list) do
     local btn = getglobal("UltimaMacrosListButton"..i)
     if not btn then
-      btn = CreateFrame("Button", "UltimaMacrosListButton"..i, UltimaMacrosListContent, "UIPanelButtonTemplate")
-      btn:SetWidth(150)
-      btn:SetHeight(20)
+      -- Create a flat modern-style button
+      btn = CreateFrame("Button", "UltimaMacrosListButton"..i, UltimaMacrosListContent)
+      btn:SetWidth(btnWidth)
+      btn:SetHeight(22)
+
+      -- Create highlight texture
+      local highlight = btn:CreateTexture(nil, "HIGHLIGHT")
+      highlight:SetAllPoints(btn)
+      highlight:SetTexture(1, 1, 1, 0.15)
+      btn._highlight = highlight
+
+      -- Create selected/background texture
+      local bg = btn:CreateTexture(nil, "BACKGROUND")
+      bg:SetAllPoints(btn)
+      bg:SetTexture(0, 0, 0, 0)
+      btn._bg = bg
+
+      -- Create icon texture
+      local icon = btn:CreateTexture(nil, "ARTWORK")
+      icon:SetWidth(18)
+      icon:SetHeight(18)
+      icon:SetPoint("LEFT", btn, "LEFT", 4, 0)
+      btn._icon = icon
+
+      -- Create text
+      local text = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+      text:SetPoint("LEFT", icon, "RIGHT", 4, 0)
+      text:SetPoint("RIGHT", btn, "RIGHT", -4, 0)
+      text:SetJustifyH("LEFT")
+      btn._text = text
+
+      -- Create scope tag
+      local scopeTag = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+      scopeTag:SetPoint("RIGHT", btn, "RIGHT", -4, 0)
+      scopeTag:SetJustifyH("RIGHT")
+      btn._scopeTag = scopeTag
     else
       if btn:GetParent() ~= UltimaMacrosListContent then
         btn:SetParent(UltimaMacrosListContent)
       end
     end
 
+    btn:SetWidth(btnWidth)
     btn:ClearAllPoints()
     btn:SetPoint("TOPLEFT", UltimaMacrosListContent, "TOPLEFT", 4, offsetY)
 
-    local name = list[i].name
-    local tag  = (list[i]._scope == "account") and "[A] " or "[C] "
-    btn:SetText(tag .. name)
+    -- Store data on button for Lua 5.0 closure compatibility
+    local rec = list[i]
+    btn._macroName = rec.name
+    btn._macroScope = rec._scope
+    btn._macroText = rec.text or ""
+    btn._index = i
+
+    -- Set icon
+    local iconPath = UM_TexturePath(rec.icon or UM_DEFAULT_ICON)
+    btn._icon:SetTexture(iconPath)
+
+    -- Set name text
+    btn._text:SetText(rec.name)
+    btn._text:SetTextColor(1, 1, 1)
+
+    -- Set scope tag with color
+    if rec._scope == "account" then
+      btn._scopeTag:SetText("[A]")
+      btn._scopeTag:SetTextColor(1.0, 0.8, 0.3)
+    else
+      btn._scopeTag:SetText("[C]")
+      btn._scopeTag:SetTextColor(0.3, 0.8, 1.0)
+    end
 
     btn:SetScript("OnClick", function()
-      UM_UI_LoadIntoEditor(name)
+      local selfBtn = this
+      UM_UI_LoadIntoEditor(selfBtn._macroName)
+      -- Update visual selection
+      local idx2 = 1
+      while true do
+        local otherBtn = getglobal("UltimaMacrosListButton"..idx2)
+        if not otherBtn then break end
+        if otherBtn._bg then
+          if otherBtn == selfBtn then
+            otherBtn._bg:SetTexture(0.2, 0.4, 0.6, 0.4)
+          else
+            otherBtn._bg:SetTexture(0, 0, 0, 0)
+          end
+        end
+        idx2 = idx2 + 1
+      end
     end)
 
     btn:SetScript("OnDoubleClick", function()
-      UM_UI_LoadIntoEditor(name)
+      UM_UI_LoadIntoEditor(this._macroName)
       if UltimaMacrosFrameEditBox then
         UltimaMacrosFrameEditBox:SetFocus()
       end
     end)
 
     btn:RegisterForDrag("LeftButton")
-    btn:SetScript("OnDragStart", function() UM_StartDrag(name) end)
+    btn:SetScript("OnDragStart", function() UM_StartDrag(this._macroName) end)
 
     btn:SetScript("OnEnter", function()
-      GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
-      GameTooltip:SetText(name)
-      local scopeText = (list[i]._scope == "account") and "Account-wide" or "Character"
+      local selfBtn = this
+      GameTooltip:SetOwner(selfBtn, "ANCHOR_RIGHT")
+      GameTooltip:SetText(selfBtn._macroName)
+      local scopeText = (selfBtn._macroScope == "account") and "Account-wide" or "Character"
       GameTooltip:AddLine("Scope: " .. scopeText, 0.7, 0.7, 0.7)
-      local charCount = string.len(list[i].text or "")
-      GameTooltip:AddLine(charCount .. "/2056 characters", 0.5, 0.5, 0.5)
+      local charCount = string.len(selfBtn._macroText)
+      GameTooltip:AddLine(charCount .. "/7000 characters", 0.5, 0.5, 0.5)
       GameTooltip:AddLine(" ", 1, 1, 1)
       GameTooltip:AddLine("Double-click to edit", 0.3, 1, 0.3, true)
       GameTooltip:AddLine("Drag to action bar", 0.3, 1, 0.3, true)
@@ -993,7 +1441,7 @@ function UM_UI_RefreshList()
     btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     btn:Show()
-    offsetY = offsetY - 22
+    offsetY = offsetY - 24
   end
 
   -- Update content height based on number of items
@@ -1025,18 +1473,18 @@ function UM_UI_LoadIntoEditor(name)
   if UltimaMacrosScopeCheck then
     UltimaMacrosScopeCheck:SetChecked(UM_UI_Scope == "char")
     if UM_UI_Scope == "char" then
-      UltimaMacrosScopeCheckText:SetText("Per Character (uncheck for Account-wide)")
+      UltimaMacrosScopeCheckText:SetText("Char")
     else
-      UltimaMacrosScopeCheckText:SetText("Account-wide (check for Per Character)")
+      UltimaMacrosScopeCheckText:SetText("Acct")
     end
   end
 
   if UM_LocalUI.scopeIndicator then
     if UM_UI_Scope == "char" then
-      UM_LocalUI.scopeIndicator:SetText("[Char]")
+      UM_LocalUI.scopeIndicator:SetText("[C]")
       UM_LocalUI.scopeIndicator:SetTextColor(0.3, 0.8, 1.0)
     else
-      UM_LocalUI.scopeIndicator:SetText("[Account]")
+      UM_LocalUI.scopeIndicator:SetText("[A]")
       UM_LocalUI.scopeIndicator:SetTextColor(1.0, 0.8, 0.3)
     end
   end
@@ -1084,8 +1532,8 @@ end
 function UM_UI_Save()
   local name = UltimaMacrosFrameNameEdit:GetText() or ""
   local text = UltimaMacrosFrameEditBox:GetText() or ""
-  if string.len(text) > 2056 then
-    text = string.sub(text, 1, 2056)
+  if string.len(text) > 7000 then
+    text = string.sub(text, 1, 7000)
     UltimaMacrosFrameEditBox:SetText(text)
   end
   UM_Save(name, text, UM_UI_Scope)
@@ -1172,28 +1620,28 @@ function UM_UI_UpdateCounter()
   end
   local text = UltimaMacrosFrameEditBox:GetText() or ""
   local used = string.len(text)
-  if used > 2056 then
-    text = string.sub(text, 1, 2056)
+  if used > 7000 then
+    text = string.sub(text, 1, 7000)
     UltimaMacrosFrameEditBox:SetText(text)
-    used = 2056
+    used = 7000
   end
-  UltimaMacrosFrameCounter:SetText(used .. "/2056")
+  UltimaMacrosFrameCounter:SetText(used .. "/7000")
 end
 
 function UM_UI_ToggleScope()
   local checked = UltimaMacrosScopeCheck:GetChecked()
   if checked then
     UM_UI_Scope = "char"
-    UltimaMacrosScopeCheckText:SetText("Per Character (uncheck for Account-wide)")
+    UltimaMacrosScopeCheckText:SetText("Char")
     if UM_LocalUI.scopeIndicator then
-      UM_LocalUI.scopeIndicator:SetText("[Char]")
+      UM_LocalUI.scopeIndicator:SetText("[C]")
       UM_LocalUI.scopeIndicator:SetTextColor(0.3, 0.8, 1.0)
     end
   else
     UM_UI_Scope = "account"
-    UltimaMacrosScopeCheckText:SetText("Account-wide (check for Per Character)")
+    UltimaMacrosScopeCheckText:SetText("Acct")
     if UM_LocalUI.scopeIndicator then
-      UM_LocalUI.scopeIndicator:SetText("[Account]")
+      UM_LocalUI.scopeIndicator:SetText("[A]")
       UM_LocalUI.scopeIndicator:SetTextColor(1.0, 0.8, 0.3)
     end
   end
@@ -1202,12 +1650,12 @@ end
 function UM_UI_SetScopeAccount()
   UM_UI_Scope = "account"
   UltimaMacrosScopeCheck:SetChecked(false)
-  UltimaMacrosScopeCheckText:SetText("Per Account")
+  UltimaMacrosScopeCheckText:SetText("Acct")
 end
 function UM_UI_SetScopeChar()
   UM_UI_Scope = "char"
   UltimaMacrosScopeCheck:SetChecked(true)
-  UltimaMacrosScopeCheckText:SetText("Per Character")
+  UltimaMacrosScopeCheckText:SetText("Char")
 end
 
 local function UM_IconBasename(tex)
@@ -1287,13 +1735,113 @@ end
 -- Pure-Lua UI (no XML needed)
 -- ===========================
 
+-- Default and minimum sizes
+local UM_DEFAULT_WIDTH = 820
+local UM_DEFAULT_HEIGHT = 580
+local UM_MIN_WIDTH = 650
+local UM_MIN_HEIGHT = 450
+
 local function UM_SkinFrame(frame)
   frame:SetBackdrop({
-    bgFile  = "Interface\\DialogFrame\\UI-DialogBox-Background",
-    edgeFile= "Interface\\DialogFrame\\UI-DialogBox-Border",
-    tile = true, tileSize = 32, edgeSize = 32,
-    insets = { left = 11, right = 12, top = 12, bottom = 11 },
+    bgFile  = "Interface\\Tooltips\\UI-Tooltip-Background",
+    edgeFile= "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = true, tileSize = 16, edgeSize = 16,
+    insets = { left = 4, right = 4, top = 4, bottom = 4 },
   })
+  frame:SetBackdropColor(0.05, 0.05, 0.08, 0.95)
+  frame:SetBackdropBorderColor(0.4, 0.4, 0.5, 1)
+end
+
+-- Style a scroll frame's scroll bar with modern flat look
+local function UM_StyleScrollBar(scrollFrameName)
+  local bar = getglobal(scrollFrameName .. "ScrollBar")
+  if not bar then return end
+
+  -- Style the scroll bar background
+  local barBg = bar:CreateTexture(nil, "BACKGROUND")
+  barBg:SetAllPoints(bar)
+  barBg:SetTexture(0.1, 0.1, 0.1, 0.6)
+
+  -- Style the thumb (slider)
+  local thumb = getglobal(scrollFrameName .. "ScrollBarThumbTexture")
+  if thumb then
+    thumb:SetTexture(0.35, 0.35, 0.4, 0.9)
+    thumb:SetWidth(12)
+  end
+
+  -- Style up button
+  local upBtn = getglobal(scrollFrameName .. "ScrollBarScrollUpButton")
+  if upBtn then
+    -- Hide default textures
+    local upNormal = upBtn:GetNormalTexture()
+    local upPushed = upBtn:GetPushedTexture()
+    local upDisabled = upBtn:GetDisabledTexture()
+    local upHighlight = upBtn:GetHighlightTexture()
+    if upNormal then upNormal:SetAlpha(0) end
+    if upPushed then upPushed:SetAlpha(0) end
+    if upDisabled then upDisabled:SetAlpha(0) end
+    if upHighlight then upHighlight:SetAlpha(0) end
+
+    -- Create flat background
+    local upBg = upBtn:CreateTexture(nil, "BACKGROUND")
+    upBg:SetAllPoints(upBtn)
+    upBg:SetTexture(0.2, 0.2, 0.2, 0.8)
+    upBtn._bg = upBg
+
+    -- Create simple arrow
+    local upArrow = upBtn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    upArrow:SetPoint("CENTER", upBtn, "CENTER", 0, 0)
+    upArrow:SetText("^")
+    upArrow:SetTextColor(0.7, 0.7, 0.7)
+    upBtn._arrow = upArrow
+
+    -- Hover/push effects
+    upBtn:SetScript("OnEnter", function()
+      this._bg:SetTexture(0.3, 0.3, 0.35, 0.9)
+      this._arrow:SetTextColor(1, 1, 1)
+    end)
+    upBtn:SetScript("OnLeave", function()
+      this._bg:SetTexture(0.2, 0.2, 0.2, 0.8)
+      this._arrow:SetTextColor(0.7, 0.7, 0.7)
+    end)
+  end
+
+  -- Style down button
+  local downBtn = getglobal(scrollFrameName .. "ScrollBarScrollDownButton")
+  if downBtn then
+    -- Hide default textures
+    local downNormal = downBtn:GetNormalTexture()
+    local downPushed = downBtn:GetPushedTexture()
+    local downDisabled = downBtn:GetDisabledTexture()
+    local downHighlight = downBtn:GetHighlightTexture()
+    if downNormal then downNormal:SetAlpha(0) end
+    if downPushed then downPushed:SetAlpha(0) end
+    if downDisabled then downDisabled:SetAlpha(0) end
+    if downHighlight then downHighlight:SetAlpha(0) end
+
+    -- Create flat background
+    local downBg = downBtn:CreateTexture(nil, "BACKGROUND")
+    downBg:SetAllPoints(downBtn)
+    downBg:SetTexture(0.2, 0.2, 0.2, 0.8)
+    downBtn._bg = downBg
+
+    -- Create simple arrow
+    local downArrow = downBtn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    downArrow:SetPoint("CENTER", downBtn, "CENTER", 0, 0)
+    downArrow:SetText("v")
+    downArrow:SetTextColor(0.7, 0.7, 0.7)
+    downBtn._arrow = downArrow
+
+    -- Hover/push effects
+    downBtn:SetScript("OnEnter", function()
+      this._bg:SetTexture(0.3, 0.3, 0.35, 0.9)
+      this._arrow:SetTextColor(1, 1, 1)
+    end)
+    downBtn:SetScript("OnLeave", function()
+      this._bg:SetTexture(0.2, 0.2, 0.2, 0.8)
+      this._arrow:SetTextColor(0.7, 0.7, 0.7)
+    end)
+  end
 end
 
 -- Helper: Create section header with divider line
@@ -1301,14 +1849,29 @@ local function UM_CreateSectionHeader(parent, text, yOffset)
   local header = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
   header:SetPoint("TOPLEFT", parent, "TOPLEFT", 12, yOffset)
   header:SetText(text)
+  header:SetTextColor(0.9, 0.8, 0.5)
 
   local line = parent:CreateTexture(nil, "ARTWORK")
   line:SetHeight(1)
   line:SetPoint("LEFT", header, "BOTTOMLEFT", 0, -2)
   line:SetPoint("RIGHT", parent, "RIGHT", -12, 0)
-  line:SetTexture(0.5, 0.5, 0.5, 0.5)
+  line:SetTexture(0.4, 0.4, 0.5, 0.8)
 
   return header
+end
+
+-- Helper: Create a styled panel/container
+local function UM_CreatePanel(parent, name)
+  local panel = CreateFrame("Frame", name, parent)
+  panel:SetBackdrop({
+    bgFile  = "Interface\\Tooltips\\UI-Tooltip-Background",
+    edgeFile= "Interface\\Tooltips\\UI-Tooltip-Border",
+    tile = true, tileSize = 16, edgeSize = 12,
+    insets = { left = 3, right = 3, top = 3, bottom = 3 },
+  })
+  panel:SetBackdropColor(0.1, 0.1, 0.12, 0.9)
+  panel:SetBackdropBorderColor(0.3, 0.3, 0.4, 1)
+  return panel
 end
 
 -- ============================================================
@@ -1393,6 +1956,9 @@ local function UM_EnsureIconPicker()
   local content = CreateFrame("Frame", "UltimaMacrosIconGrid", scroll)
   content:SetWidth(320); content:SetHeight(300)
   scroll:SetScrollChild(content)
+
+  -- Style the icon picker scroll bar
+  UM_StyleScrollBar("UltimaMacrosIconScroll")
 
   f.scroll = scroll
   f.content = content
@@ -1538,11 +2104,78 @@ end
 -- ============================================================
 -- Main UI
 -- ============================================================
+
+-- Layout constants
+local UM_PADDING = 8
+local UM_TITLE_HEIGHT = 32
+local UM_LIST_WIDTH = 200
+local UM_TOOLBAR_HEIGHT = 70
+
+-- Layout update function (called on resize)
+local function UM_UpdateLayout(f)
+  local w = f:GetWidth()
+  local h = f:GetHeight()
+
+  local contentTop = UM_TITLE_HEIGHT + UM_PADDING
+  local contentBottom = UM_PADDING + 4
+  local contentHeight = h - contentTop - contentBottom
+
+  -- List panel - left side, full height
+  local listWidth = UM_LIST_WIDTH
+  if UM_LocalUI.listPanel then
+    UM_LocalUI.listPanel:SetWidth(listWidth)
+    UM_LocalUI.listPanel:SetHeight(contentHeight)
+  end
+  if UM_LocalUI.listScroll then
+    UM_LocalUI.listScroll:SetWidth(listWidth - 28)
+    UM_LocalUI.listScroll:SetHeight(contentHeight - 36)
+  end
+  if UM_LocalUI.listContent then
+    UM_LocalUI.listContent:SetWidth(listWidth - 28)
+  end
+
+  -- Editor area - right side
+  local editorLeft = listWidth + UM_PADDING * 2
+  local editorWidth = w - editorLeft - UM_PADDING
+
+  -- Update toolbar
+  if UM_LocalUI.toolbar then
+    UM_LocalUI.toolbar:SetWidth(editorWidth)
+  end
+
+  -- Update name field
+  if UltimaMacrosFrameNameEdit then
+    UltimaMacrosFrameNameEdit:SetWidth(editorWidth - 60)
+  end
+
+  -- Update editor panel
+  local editorPanelHeight = contentHeight - UM_TOOLBAR_HEIGHT - UM_PADDING
+  if UM_LocalUI.editorPanel then
+    UM_LocalUI.editorPanel:SetWidth(editorWidth)
+    UM_LocalUI.editorPanel:SetHeight(editorPanelHeight)
+  end
+  if UltimaMacrosEditScroll then
+    UltimaMacrosEditScroll:SetWidth(editorWidth - 28)
+    UltimaMacrosEditScroll:SetHeight(editorPanelHeight - 16)
+  end
+  if UltimaMacrosFrameEditBox then
+    UltimaMacrosFrameEditBox:SetWidth(editorWidth - 28)
+  end
+
+  -- Save size
+  UltimaMacrosDB.size = { w = w, h = h }
+end
+
 function UM_BuildGUI()
   if UM_LocalUI and UM_LocalUI.frame then return end
 
   local f = CreateFrame("Frame", "UltimaMacrosFrame", UIParent)
-  f:SetWidth(720); f:SetHeight(470)
+
+  -- Restore saved size or use defaults
+  local savedW = UltimaMacrosDB and UltimaMacrosDB.size and UltimaMacrosDB.size.w or UM_DEFAULT_WIDTH
+  local savedH = UltimaMacrosDB and UltimaMacrosDB.size and UltimaMacrosDB.size.h or UM_DEFAULT_HEIGHT
+  f:SetWidth(savedW)
+  f:SetHeight(savedH)
 
   if UltimaMacrosDB and UltimaMacrosDB.pos then
     f:ClearAllPoints()
@@ -1553,6 +2186,9 @@ function UM_BuildGUI()
   end
 
   f:SetMovable(true)
+  f:SetResizable(true)
+  f:SetMinResize(UM_MIN_WIDTH, UM_MIN_HEIGHT)
+  f:SetMaxResize(1200, 900)
   f:EnableMouse(true)
   f:RegisterForDrag("LeftButton")
   f:SetScript("OnDragStart", function() f:StartMoving() end)
@@ -1560,6 +2196,9 @@ function UM_BuildGUI()
     f:StopMovingOrSizing()
     local p, _, rp, x, y = f:GetPoint()
     UltimaMacrosDB.pos = { p = p, rp = rp, x = x, y = y }
+  end)
+  f:SetScript("OnSizeChanged", function()
+    UM_UpdateLayout(f)
   end)
   f:SetScript("OnHide", function()
     f:StopMovingOrSizing()
@@ -1576,15 +2215,30 @@ function UM_BuildGUI()
     UIPanelWindows[f:GetName()] = { area = "center", pushable = 1 }
   end
 
+  -- Title bar background
+  local titleBar = f:CreateTexture(nil, "ARTWORK")
+  titleBar:SetHeight(28)
+  titleBar:SetPoint("TOPLEFT", f, "TOPLEFT", 4, -4)
+  titleBar:SetPoint("TOPRIGHT", f, "TOPRIGHT", -4, -4)
+  titleBar:SetTexture(0.15, 0.15, 0.2, 0.9)
+
   -- Title
-  local title = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
-  title:SetPoint("TOP", f, "TOP", 0, -16)
+  local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+  title:SetPoint("TOP", f, "TOP", 0, -10)
   title:SetText("UltimaMacros")
+  title:SetTextColor(0.9, 0.8, 0.5)
+
+  -- Version text
+  local version = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  version:SetPoint("LEFT", title, "RIGHT", 8, 0)
+  version:SetText("v1.1")
+  version:SetTextColor(0.5, 0.5, 0.5)
 
   -- Drag area
   local drag = CreateFrame("Frame", nil, f)
-  drag:SetWidth(680); drag:SetHeight(26)
-  drag:SetPoint("TOP", f, "TOP", 0, -12)
+  drag:SetHeight(28)
+  drag:SetPoint("TOPLEFT", f, "TOPLEFT", 4, -4)
+  drag:SetPoint("TOPRIGHT", f, "TOPRIGHT", -30, -4)
   drag:EnableMouse(true)
   drag:RegisterForDrag("LeftButton")
   drag:SetScript("OnDragStart", function() f:StartMoving() end)
@@ -1596,39 +2250,94 @@ function UM_BuildGUI()
 
   -- Close button
   local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
-  close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -6, -6)
+  close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
   close:SetScript("OnClick", function() HideUIPanel(f) end)
 
-  -- ===== LEFT SIDE: Macro List =====
-  local macrosHeader = UM_CreateSectionHeader(f, "Macros", -50)
+  -- Resize grip (bottom-right corner)
+  local resizeGrip = CreateFrame("Frame", nil, f)
+  resizeGrip:SetWidth(16)
+  resizeGrip:SetHeight(16)
+  resizeGrip:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -4, 4)
+  resizeGrip:EnableMouse(true)
 
-  local listScroll = CreateFrame("ScrollFrame", "UltimaMacrosListScroll", f, "UIPanelScrollFrameTemplate")
-  listScroll:SetWidth(150); listScroll:SetHeight(360)
-  listScroll:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -70)
+  local gripTex = resizeGrip:CreateTexture(nil, "OVERLAY")
+  gripTex:SetAllPoints(resizeGrip)
+  gripTex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+
+  resizeGrip:SetScript("OnEnter", function()
+    gripTex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Highlight")
+  end)
+  resizeGrip:SetScript("OnLeave", function()
+    gripTex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+  end)
+  resizeGrip:SetScript("OnMouseDown", function()
+    gripTex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Down")
+    f:StartSizing("BOTTOMRIGHT")
+  end)
+  resizeGrip:SetScript("OnMouseUp", function()
+    gripTex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+    f:StopMovingOrSizing()
+    UM_UpdateLayout(f)
+  end)
+
+  -- ===== LEFT SIDE: Macro List =====
+  local contentTop = -(UM_TITLE_HEIGHT + UM_PADDING)
+  local listWidth = UM_LIST_WIDTH
+  local contentHeight = f:GetHeight() - UM_TITLE_HEIGHT - UM_PADDING * 2
+
+  local listPanel = UM_CreatePanel(f, "UltimaMacrosListPanel")
+  listPanel:SetWidth(listWidth)
+  listPanel:SetHeight(contentHeight)
+  listPanel:SetPoint("TOPLEFT", f, "TOPLEFT", UM_PADDING, contentTop)
+  UM_LocalUI.listPanel = listPanel
+
+  local macrosHeader = listPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  macrosHeader:SetPoint("TOP", listPanel, "TOP", 0, -8)
+  macrosHeader:SetText("Macros")
+  macrosHeader:SetTextColor(0.9, 0.8, 0.5)
+
+  local listScroll = CreateFrame("ScrollFrame", "UltimaMacrosListScroll", listPanel, "UIPanelScrollFrameTemplate")
+  listScroll:SetWidth(listWidth - 28)
+  listScroll:SetHeight(contentHeight - 36)
+  listScroll:SetPoint("TOPLEFT", listPanel, "TOPLEFT", 6, -28)
+  UM_LocalUI.listScroll = listScroll
 
   local listContent = CreateFrame("Frame", "UltimaMacrosListContent", listScroll)
-  listContent:SetWidth(150); listContent:SetHeight(360)
+  listContent:SetWidth(listWidth - 28)
+  listContent:SetHeight(600)
   listContent:SetPoint("TOPLEFT", listScroll, "TOPLEFT", 0, 0)
   listScroll:SetScrollChild(listContent)
+  UM_LocalUI.listContent = listContent
+
+  -- Style the list scroll bar
+  UM_StyleScrollBar("UltimaMacrosListScroll")
 
   -- ===== RIGHT SIDE: Editor =====
-  local editorHeader = UM_CreateSectionHeader(f, "Editor", -50)
-  editorHeader:ClearAllPoints()
-  editorHeader:SetPoint("TOPLEFT", f, "TOPLEFT", 200, -50)
+  local editorLeft = listWidth + UM_PADDING * 2
+  local editorWidth = f:GetWidth() - editorLeft - UM_PADDING
 
-  -- Name field
-  local nameLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  nameLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 200, -68)
+  -- Toolbar panel (contains name, icon, buttons)
+  local toolbar = UM_CreatePanel(f, "UltimaMacrosToolbar")
+  toolbar:SetWidth(editorWidth)
+  toolbar:SetHeight(UM_TOOLBAR_HEIGHT)
+  toolbar:SetPoint("TOPLEFT", f, "TOPLEFT", editorLeft, contentTop)
+  UM_LocalUI.toolbar = toolbar
+
+  -- Row 1: Name field
+  local nameLabel = toolbar:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  nameLabel:SetPoint("TOPLEFT", toolbar, "TOPLEFT", 10, -10)
   nameLabel:SetText("Name:")
+  nameLabel:SetTextColor(0.9, 0.8, 0.5)
 
-  local nameEdit = CreateFrame("EditBox", "UltimaMacrosFrameNameEdit", f, "InputBoxTemplate")
-  nameEdit:SetWidth(360); nameEdit:SetHeight(20)
-  nameEdit:SetPoint("TOPLEFT", nameLabel, "BOTTOMLEFT", 5, -4)
+  local nameEdit = CreateFrame("EditBox", "UltimaMacrosFrameNameEdit", toolbar, "InputBoxTemplate")
+  nameEdit:SetWidth(editorWidth - 60)
+  nameEdit:SetHeight(22)
+  nameEdit:SetPoint("LEFT", nameLabel, "RIGHT", 6, 0)
   nameEdit:SetAutoFocus(false)
   nameEdit:EnableMouse(true)
   nameEdit:EnableKeyboard(true)
   if nameEdit.SetMaxLetters then nameEdit:SetMaxLetters(64) end
-  nameEdit:SetTextInsets(8, 8, 2, 2)
+  nameEdit:SetTextInsets(6, 6, 2, 2)
 
   nameEdit:SetScript("OnMouseDown", function() this:SetFocus() end)
   nameEdit:SetScript("OnEnterPressed", function()
@@ -1644,23 +2353,28 @@ function UM_BuildGUI()
     end
   end)
 
-  -- Scope indicator
-  local scopeIndicator = f:CreateFontString("UltimaMacrosScopeIndicator", "OVERLAY", "GameFontHighlight")
-  scopeIndicator:SetPoint("LEFT", nameEdit, "RIGHT", 8, 0)
-  scopeIndicator:SetText("[Char]")
+  -- Scope indicator (next to name)
+  local scopeIndicator = toolbar:CreateFontString("UltimaMacrosScopeIndicator", "OVERLAY", "GameFontHighlightSmall")
+  scopeIndicator:SetPoint("LEFT", nameEdit, "RIGHT", 4, 0)
+  scopeIndicator:SetText("[C]")
   scopeIndicator:SetTextColor(0.3, 0.8, 1.0)
 
+  -- Row 2: Icon, scope checkbox, and action buttons
+  local row2Y = -38
+
   -- Icon button
-  local iconBtn = CreateFrame("Button", "UltimaMacrosIconButton", f)
-  iconBtn:SetWidth(36); iconBtn:SetHeight(36)
-  iconBtn:SetPoint("TOPLEFT", nameEdit, "BOTTOMLEFT", 0, -8)
+  local iconBtn = CreateFrame("Button", "UltimaMacrosIconButton", toolbar)
+  iconBtn:SetWidth(26); iconBtn:SetHeight(26)
+  iconBtn:SetPoint("TOPLEFT", toolbar, "TOPLEFT", 10, row2Y)
   iconBtn:SetNormalTexture(UM_TexturePath(UM_DEFAULT_ICON))
   iconBtn:SetBackdrop({
+    bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
     edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-    edgeSize = 12,
+    edgeSize = 10,
     insets = { left = 2, right = 2, top = 2, bottom = 2 }
   })
-  iconBtn:SetBackdropBorderColor(0.6, 0.6, 0.6, 1)
+  iconBtn:SetBackdropColor(0.1, 0.1, 0.1, 1)
+  iconBtn:SetBackdropBorderColor(0.5, 0.5, 0.6, 1)
   iconBtn:RegisterForDrag("LeftButton")
   iconBtn._idx = 1
 
@@ -1670,44 +2384,84 @@ function UM_BuildGUI()
     UM_StartDrag(nm)
   end)
   iconBtn:SetScript("OnEnter", function()
+    this:SetBackdropBorderColor(0.8, 0.7, 0.3, 1)
     GameTooltip:SetOwner(this, "ANCHOR_RIGHT")
     GameTooltip:SetText("Macro Icon")
-    GameTooltip:AddLine("Click to choose a different icon", 1, 1, 1, true)
-    GameTooltip:AddLine("Drag to place macro on action bar", 0.7, 0.7, 0.7, true)
+    GameTooltip:AddLine("Click to choose icon", 1, 1, 1, true)
+    GameTooltip:AddLine("Drag to action bar", 0.7, 0.7, 0.7, true)
     GameTooltip:Show()
   end)
-  iconBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
-
-  local iconLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  iconLabel:SetPoint("LEFT", iconBtn, "RIGHT", 6, 0)
-  iconLabel:SetText("Icon (click to change, drag to action bar)")
+  iconBtn:SetScript("OnLeave", function()
+    this:SetBackdropBorderColor(0.5, 0.5, 0.6, 1)
+    GameTooltip:Hide()
+  end)
 
   -- Scope checkbox
-  local scopeCheck = CreateFrame("CheckButton", "UltimaMacrosScopeCheck", f, "UICheckButtonTemplate")
-  scopeCheck:SetPoint("TOPLEFT", iconBtn, "BOTTOMLEFT", -4, -8)
+  local scopeCheck = CreateFrame("CheckButton", "UltimaMacrosScopeCheck", toolbar, "UICheckButtonTemplate")
+  scopeCheck:SetWidth(20); scopeCheck:SetHeight(20)
+  scopeCheck:SetPoint("LEFT", iconBtn, "RIGHT", 6, 0)
   scopeCheck:SetChecked(true)
 
-  _G["UltimaMacrosScopeCheckText"] = f:CreateFontString("UltimaMacrosScopeCheckText", "OVERLAY", "GameFontHighlightSmall")
-  UltimaMacrosScopeCheckText:SetPoint("LEFT", scopeCheck, "RIGHT", 4, 0)
-  UltimaMacrosScopeCheckText:SetText("Per Character (uncheck for Account-wide)")
+  _G["UltimaMacrosScopeCheckText"] = toolbar:CreateFontString("UltimaMacrosScopeCheckText", "OVERLAY", "GameFontHighlightSmall")
+  UltimaMacrosScopeCheckText:SetPoint("LEFT", scopeCheck, "RIGHT", 0, 0)
+  UltimaMacrosScopeCheckText:SetText("Char")
   scopeCheck:SetScript("OnClick", function() if UM_UI_ToggleScope then UM_UI_ToggleScope() end end)
 
-  -- Buttons
-  local BTN_WIDTH = 70
+  -- Styled button creator (modern flat style)
+  local BTN_WIDTH = 55
+  local BTN_HEIGHT = 22
   local BTN_SPACING = 4
 
   local function makeBtn(name, label, parent)
-    local b = CreateFrame("Button", name, parent, "UIPanelButtonTemplate")
-    b:SetWidth(BTN_WIDTH); b:SetHeight(22)
-    b:SetText(label)
+    local b = CreateFrame("Button", name, parent)
+    b:SetWidth(BTN_WIDTH); b:SetHeight(BTN_HEIGHT)
+
+    -- Background
+    local bg = b:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints(b)
+    bg:SetTexture(0.15, 0.15, 0.15, 0.9)
+    b._bg = bg
+
+    -- Border
+    b:SetBackdrop({
+      edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+      edgeSize = 8,
+      insets = { left = 2, right = 2, top = 2, bottom = 2 }
+    })
+    b:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
+
+    -- Highlight texture
+    local hl = b:CreateTexture(nil, "HIGHLIGHT")
+    hl:SetAllPoints(b)
+    hl:SetTexture(1, 1, 1, 0.1)
+
+    -- Text
+    local text = b:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    text:SetPoint("CENTER", b, "CENTER", 0, 0)
+    text:SetText(label)
+    text:SetTextColor(0.9, 0.85, 0.7)
+    b._text = text
+
+    -- Pushed state
+    b:SetScript("OnMouseDown", function()
+      if this:IsEnabled() == 1 then
+        this._bg:SetTexture(0.08, 0.08, 0.08, 0.95)
+        this._text:SetPoint("CENTER", this, "CENTER", 1, -1)
+      end
+    end)
+    b:SetScript("OnMouseUp", function()
+      this._bg:SetTexture(0.15, 0.15, 0.15, 0.9)
+      this._text:SetPoint("CENTER", this, "CENTER", 0, 0)
+    end)
+
     return b
   end
 
-  local newC = makeBtn("UltimaMacrosNewCharButton", "New", f)
-  newC:SetPoint("TOPLEFT", scopeCheck, "BOTTOMLEFT", 4, -10)
+  local newC = makeBtn("UltimaMacrosNewCharButton", "New", toolbar)
+  newC:SetPoint("LEFT", UltimaMacrosScopeCheckText, "RIGHT", 12, 0)
   newC:SetScript("OnClick", function() if UM_UI_NewChar then UM_UI_NewChar() end end)
 
-  local save = makeBtn("UltimaMacrosSaveButton", "Save", f)
+  local save = makeBtn("UltimaMacrosSaveButton", "Save", toolbar)
   save:SetPoint("LEFT", newC, "RIGHT", BTN_SPACING, 0)
   save:SetScript("OnClick", function() if UM_UI_Save then UM_UI_Save() end end)
   save:SetScript("OnEnter", function()
@@ -1717,41 +2471,40 @@ function UM_BuildGUI()
   end)
   save:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
-  local run = makeBtn("UltimaMacrosRunButton", "Run", f)
+  local run = makeBtn("UltimaMacrosRunButton", "Run", toolbar)
   run:SetPoint("LEFT", save, "RIGHT", BTN_SPACING, 0)
   run:SetScript("OnClick", function() if UM_UI_Run then UM_UI_Run() end end)
 
-  local del = makeBtn("UltimaMacrosDeleteButton", "Delete", f)
+  local del = makeBtn("UltimaMacrosDeleteButton", "Del", toolbar)
   del:SetPoint("LEFT", run, "RIGHT", BTN_SPACING, 0)
   del:SetScript("OnClick", function() if UM_UI_Delete then UM_UI_Delete() end end)
 
-  -- Editor background
-  local editorBG = CreateFrame("Frame", "UltimaMacrosEditorBG", f)
-  editorBG:SetWidth(380); editorBG:SetHeight(230)
-  editorBG:SetPoint("TOPLEFT", newC, "BOTTOMLEFT", -4, -8)
-  editorBG:SetBackdrop({
-    bgFile  = "Interface\\Tooltips\\UI-Tooltip-Background",
-    edgeFile= "Interface\\Tooltips\\UI-Tooltip-Border",
-    tile = true, tileSize = 12, edgeSize = 12,
-    insets = { left=2, right=2, top=2, bottom=2 }
-  })
-  editorBG:SetBackdropColor(0,0,0,0.8)
+  -- Character counter (in toolbar, right side)
+  local counter = toolbar:CreateFontString("UltimaMacrosFrameCounter", "OVERLAY", "GameFontHighlightSmall")
+  counter:SetPoint("RIGHT", toolbar, "RIGHT", -10, 0)
+  counter:SetPoint("TOP", toolbar, "TOP", 0, row2Y + 3)
+  counter:SetText("0/7000")
+  counter:SetTextColor(0.6, 0.6, 0.6)
 
-  -- Character counter
-  local counter = f:CreateFontString("UltimaMacrosFrameCounter", "OVERLAY", "GameFontHighlightSmall")
-  counter:SetPoint("TOPRIGHT", editorBG, "BOTTOMRIGHT", -6, -4)
-  counter:SetText("0/2056")
+  -- ===== Editor panel =====
+  local editorPanelHeight = contentHeight - UM_TOOLBAR_HEIGHT - UM_PADDING
+  local editorPanel = UM_CreatePanel(f, "UltimaMacrosEditorPanel")
+  editorPanel:SetWidth(editorWidth)
+  editorPanel:SetHeight(editorPanelHeight)
+  editorPanel:SetPoint("TOPLEFT", toolbar, "BOTTOMLEFT", 0, -UM_PADDING)
+  UM_LocalUI.editorPanel = editorPanel
 
   -- EditBox with scroll
-  local editScroll = CreateFrame("ScrollFrame", "UltimaMacrosEditScroll", f, "UIPanelScrollFrameTemplate")
-  editScroll:SetWidth(360); editScroll:SetHeight(210)
-  editScroll:SetPoint("TOPLEFT", editorBG, "TOPLEFT", 10, -10)
+  local editScroll = CreateFrame("ScrollFrame", "UltimaMacrosEditScroll", editorPanel, "UIPanelScrollFrameTemplate")
+  editScroll:SetWidth(editorWidth - 28)
+  editScroll:SetHeight(editorPanelHeight - 16)
+  editScroll:SetPoint("TOPLEFT", editorPanel, "TOPLEFT", 6, -8)
   editScroll:EnableMouse(true)
 
   local editBox = CreateFrame("EditBox", "UltimaMacrosFrameEditBox", editScroll)
   editBox:SetMultiLine(true)
-  editBox:SetWidth(360)
-  editBox:SetHeight(1200)
+  editBox:SetWidth(editorWidth - 30)
+  editBox:SetHeight(2000)
   editBox:SetTextInsets(6, 6, 4, 4)
   editBox:SetFontObject(ChatFontNormal)
   editBox:SetAutoFocus(false)
@@ -1760,6 +2513,9 @@ function UM_BuildGUI()
 
   editScroll:SetScrollChild(editBox)
   if editScroll.UpdateScrollChildRect then editScroll:UpdateScrollChildRect() end
+
+  -- Style the edit scroll bar
+  UM_StyleScrollBar("UltimaMacrosEditScroll")
 
   editBox:SetScript("OnTextChanged", function()
     UM_hasUnsavedChanges = true
@@ -1832,16 +2588,92 @@ function UM_BuildGUI()
     if UltimaMacrosFrameEditBox then UltimaMacrosFrameEditBox:SetFocus() end
   end)
 
-  UM_LocalUI.listScroll  = listScroll
-  UM_LocalUI.listContent = listContent
   UM_LocalUI.scopeIndicator = scopeIndicator
   UM_LocalUI.counter = counter
 
+  -- Initial layout update
+  UM_UpdateLayout(f)
+
   f:SetScript("OnShow", function()
+    UM_UpdateLayout(f)
     if UM_UI_RefreshList then UM_UI_RefreshList() end
     if UM_UI_UpdateCounter then UM_UI_UpdateCounter() end
     if UM_RebuildIconChoices then UM_RebuildIconChoices() end
   end)
+end
+
+-- Add a button to Blizzard's MacroFrame to open UltimaMacros
+local UM_MacroFrameButtonAdded = false
+local function UM_AddMacroFrameButton()
+  if UM_MacroFrameButtonAdded then return end
+  if not MacroFrame then return end
+
+  -- Create a button on the Blizzard MacroFrame
+  local btn = CreateFrame("Button", "UltimaMacrosOpenButton", MacroFrame)
+  btn:SetWidth(58)
+  btn:SetHeight(18)
+  btn:SetPoint("TOPRIGHT", MacroFrame, "TOPRIGHT", -40, -42)
+
+  -- Style it similar to our modern buttons
+  local bg = btn:CreateTexture(nil, "BACKGROUND")
+  bg:SetAllPoints(btn)
+  bg:SetTexture(0.15, 0.15, 0.15, 0.9)
+  btn._bg = bg
+
+  btn:SetBackdrop({
+    edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+    edgeSize = 8,
+    insets = { left = 2, right = 2, top = 2, bottom = 2 }
+  })
+  btn:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
+
+  local hl = btn:CreateTexture(nil, "HIGHLIGHT")
+  hl:SetAllPoints(btn)
+  hl:SetTexture(1, 1, 1, 0.1)
+
+  local text = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  text:SetPoint("CENTER", btn, "CENTER", 0, 0)
+  text:SetText("Umacros")
+  text:SetTextColor(0.9, 0.85, 0.7)
+  btn._text = text
+
+  btn:SetScript("OnClick", function()
+    UM_ToggleFrame()
+  end)
+
+  btn:SetScript("OnEnter", function()
+    GameTooltip:SetOwner(this, "ANCHOR_BOTTOM")
+    GameTooltip:SetText("Open UltimaMacros Editor")
+    GameTooltip:AddLine("Extended macro storage with 7000 character limit", 0.7, 0.7, 0.7, true)
+    GameTooltip:Show()
+  end)
+  btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+  btn:SetScript("OnMouseDown", function()
+    this._bg:SetTexture(0.08, 0.08, 0.08, 0.95)
+    this._text:SetPoint("CENTER", this, "CENTER", 1, -1)
+  end)
+  btn:SetScript("OnMouseUp", function()
+    this._bg:SetTexture(0.15, 0.15, 0.15, 0.9)
+    this._text:SetPoint("CENTER", this, "CENTER", 0, 0)
+  end)
+
+  UM_MacroFrameButtonAdded = true
+end
+
+-- Hook MacroFrame_OnShow to add our button when it opens
+local UM_OldMacroFrame_OnShow
+local function UM_HookMacroFrame()
+  if not MacroFrame_OnShow then return end
+  if UM_OldMacroFrame_OnShow then return end
+
+  UM_OldMacroFrame_OnShow = MacroFrame_OnShow
+  MacroFrame_OnShow = function()
+    UM_AddMacroFrameButton()
+    if UM_OldMacroFrame_OnShow then
+      return UM_OldMacroFrame_OnShow()
+    end
+  end
 end
 
 -- --- Event wiring (works without XML) ---
@@ -1863,6 +2695,9 @@ UM_EventFrame:SetScript("OnEvent", function()
       UM_EnableSCMCompat()
     end
 
+    -- Hook Blizzard's MacroFrame to add our button
+    UM_HookMacroFrame()
+
     if UM_UI_RefreshList then UM_UI_RefreshList() end
     if UM_UI_UpdateCounter then UM_UI_UpdateCounter() end
     if UM_RebuildIconChoices then UM_RebuildIconChoices() end
@@ -1874,16 +2709,32 @@ UM_EventFrame:SetScript("OnEvent", function()
   elseif event == "ADDON_LOADED" then
     -- Vanilla-style global arg1 contains the addon name
     local addon = arg1
-    if addon == "SuperCleveroidMacros" or addon == "SuperCleveroid" or addon == "SuperMacro" then
+    if addon == "SuperCleveRoidMacros" or addon == "SuperCleveroidMacros"
+       or addon == "SuperCleveroid" or addon == "SuperMacro" then
       if not UM_SCM_compat_enabled then
         UM_EnableSCMCompat()
       end
+    end
+    -- Hook MacroFrame when Blizzard_Macros loads (on-demand addon)
+    if addon == "Blizzard_MacroUI" or addon == "Blizzard_Macros" then
+      UM_HookMacroFrame()
     end
 
   elseif event == "PLAYER_ENTERING_WORLD" then
     -- One-shot delayed check (some UIs finish loading after login)
     if not UM_SCM_compat_enabled and UM_IsSCMLoaded() then
       UM_EnableSCMCompat()
+    end
+
+    -- Ensure SCRM indexes our mapped slots (now that CleveRoids.ready should be true)
+    if UM_SCM_compat_enabled and CleveRoids and CleveRoids.GetAction and CleveRoids.ready then
+      for slot in pairs(UM_MappedSlots) do
+        -- Clear any stale cache so SCRM re-indexes
+        if CleveRoids.Actions then
+          CleveRoids.Actions[slot] = nil
+        end
+        pcall(CleveRoids.GetAction, slot)
+      end
     end
 
     -- Check for conflicts after entering world
@@ -1904,11 +2755,6 @@ UM_EventFrame:SetScript("OnEvent", function()
   end
 end)
 
-local function UM_Open()
-  UM_BuildGUI()
-  ShowUIPanel(UM_LocalUI.frame)
-end
-
 function UM_ToggleFrame()
   UM_BuildGUI()
   if UltimaMacrosFrame:IsShown() then
@@ -1917,3 +2763,7 @@ function UM_ToggleFrame()
     ShowUIPanel(UltimaMacrosFrame)
   end
 end
+
+-- Export functions for SuperCleveRoidMacros compatibility shim
+_G.UM_GetMappedName = UM_GetMappedName
+_G.UM_RefreshActionButtonsForSlot = UM_RefreshActionButtonsForSlot
